@@ -1,0 +1,141 @@
+version: "3"
+
+vars:
+  GO: '{{default "go" .GO}}'
+  BUILD_DIR: '{{default "build" .BUILD_DIR}}'
+  VERSION: '{{default "dev" .VERSION}}'
+  COMMIT: '{{default "unknown" .COMMIT}}'
+  BUILD_TIME: '{{default "unknown" .BUILD_TIME}}'
+  EXT: '{{if eq OS "windows"}}.exe{{end}}'
+  LDFLAGS: >-
+    -s -w
+    -X github.com/defermq/defermq/internal/buildinfo.Version={{.VERSION}}
+    -X github.com/defermq/defermq/internal/buildinfo.Commit={{.COMMIT}}
+    -X github.com/defermq/defermq/internal/buildinfo.BuildTime={{.BUILD_TIME}}
+
+tasks:
+  default:
+    desc: Показать доступные задачи
+    cmds:
+      - task --list
+
+  deps:
+    desc: Загрузить и проверить Go-зависимости
+    cmds:
+      - '{{.GO}} mod download'
+      - '{{.GO}} mod verify'
+
+  fmt:
+    desc: Отформатировать Go-код
+    cmds:
+      - '{{.GO}} fmt ./...'
+
+  vet:
+    desc: Запустить go vet
+    cmds:
+      - '{{.GO}} vet ./...'
+
+  test:
+    desc: Запустить unit-тесты
+    cmds:
+      - '{{.GO}} test ./...'
+
+  test-race:
+    desc: Запустить тесты с race detector
+    cmds:
+      - '{{.GO}} test -race ./...'
+
+  test-integration:
+    desc: Запустить opt-in integration-тесты
+    cmds:
+      - '{{.GO}} test -tags=integration ./...'
+
+  lint:
+    desc: Запустить golangci-lint из PATH
+    cmds:
+      - golangci-lint run ./...
+
+  prepare-build:
+    internal: true
+    run: once
+    cmds:
+      - cmd: powershell -NoProfile -Command "New-Item -ItemType Directory -Force '{{.BUILD_DIR}}' | Out-Null"
+        platforms: [windows]
+      - cmd: mkdir -p "{{.BUILD_DIR}}"
+        platforms: [linux, darwin]
+
+  build:
+    desc: Собрать все три бинаря в build/
+    deps: [build-gateway, build-manager, build-pusher]
+
+  build-gateway:
+    desc: Собрать defermq-gateway в build/
+    deps: [prepare-build]
+    cmds:
+      - '{{.GO}} build -trimpath -ldflags="{{.LDFLAGS}}" -o "{{.BUILD_DIR}}/defermq-gateway{{.EXT}}" ./cmd/defermq-gateway'
+
+  build-manager:
+    desc: Собрать defermq-postgres-manager в build/
+    deps: [prepare-build]
+    cmds:
+      - '{{.GO}} build -trimpath -ldflags="{{.LDFLAGS}}" -o "{{.BUILD_DIR}}/defermq-postgres-manager{{.EXT}}" ./cmd/defermq-postgres-manager'
+
+  build-pusher:
+    desc: Собрать defermq-pusher в build/
+    deps: [prepare-build]
+    cmds:
+      - '{{.GO}} build -trimpath -ldflags="{{.LDFLAGS}}" -o "{{.BUILD_DIR}}/defermq-pusher{{.EXT}}" ./cmd/defermq-pusher'
+
+  clean:
+    desc: Удалить локальные build artifacts
+    cmds:
+      - cmd: powershell -NoProfile -Command "Remove-Item -Recurse -Force '{{.BUILD_DIR}}' -ErrorAction SilentlyContinue"
+        platforms: [windows]
+      - cmd: rm -rf "{{.BUILD_DIR}}"
+        platforms: [linux, darwin]
+
+  run-gateway:
+    desc: Запустить Gateway локально
+    cmds:
+      - '{{.GO}} run ./cmd/defermq-gateway'
+
+  run-manager:
+    desc: Запустить PostgreSQL Manager локально
+    cmds:
+      - '{{.GO}} run ./cmd/defermq-postgres-manager'
+
+  run-pusher:
+    desc: Запустить Pusher локально
+    cmds:
+      - '{{.GO}} run ./cmd/defermq-pusher'
+
+  compose-build-up:
+    desc: Собрать и запустить Compose из исходников
+    cmds:
+      - docker compose -f deploy/compose/docker-compose.build.yml up --build -d
+
+  compose-images-up:
+    desc: Скачать и запустить готовые images
+    cmds:
+      - docker compose -f deploy/compose/docker-compose.images.yml pull
+      - docker compose -f deploy/compose/docker-compose.images.yml up -d
+
+  compose-down:
+    desc: Остановить Compose, сохранив volumes
+    cmds:
+      - docker compose -f deploy/compose/docker-compose.build.yml down --remove-orphans
+      - docker compose -f deploy/compose/docker-compose.images.yml down --remove-orphans
+
+  migrate-up:
+    desc: Применить SQL-миграции утилитой goose
+    requires:
+      vars: [DEFERMQ_POSTGRES_DSN]
+    cmds:
+      - goose -dir migrations postgres "{{.DEFERMQ_POSTGRES_DSN}}" up
+
+  migrate-status:
+    desc: Показать статус миграций
+    requires:
+      vars: [DEFERMQ_POSTGRES_DSN]
+    cmds:
+      - goose -dir migrations postgres "{{.DEFERMQ_POSTGRES_DSN}}" status

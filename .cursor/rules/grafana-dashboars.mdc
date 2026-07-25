@@ -1,0 +1,133 @@
+---
+description: Rules for working with or generating Grafana dashboards
+globs:
+  - "observability/dashboards/**/*.go"
+  - "observability/grafana/**/*"
+alwaysApply: false
+---
+
+# Grafana dashboard development
+
+Grafana dashboards in this repository are managed as generated artifacts.
+
+## Source of truth
+
+- The source of truth is Go code under:
+  `observability/dashboards/internal/dashboards`.
+- Generated JSON files are written to:
+  `observability/dashboards/generated`.
+- Never manually edit generated JSON files.
+- Never implement a dashboard directly as a large JSON literal.
+- Use Grafana Foundation SDK and the local `dashkit` helpers.
+- Prefer extending `dashkit` over duplicating verbose panel configuration.
+
+## Workflow
+
+When creating or changing a dashboard:
+
+1. Inspect the application metric declarations and collectors.
+2. Find the exact metric names, labels, types and units.
+3. Do not invent metrics that do not exist.
+4. Write a short dashboard design before implementation:
+   - intended audience;
+   - operational questions;
+   - rows;
+   - panels;
+   - PromQL expressions;
+   - variables;
+   - expected metric labels.
+5. Implement or update the Go dashboard generator.
+6. Run formatting and tests.
+7. Generate the dashboard JSON.
+8. Verify that a second generation produces no diff.
+9. Inspect the generated JSON only as a build artifact.
+10. Do not finish while generation or tests are failing.
+
+## Dashboard conventions
+
+Every service overview dashboard should normally contain:
+
+1. Overview
+   - availability;
+   - throughput;
+   - error rate;
+   - latency;
+   - active workers;
+   - current backlog.
+
+2. Processing
+   - completed operations;
+   - failed operations;
+   - retries;
+   - processing duration;
+   - batch sizes.
+
+3. Dependencies
+   - database operation duration;
+   - database errors;
+   - connection pool state;
+   - external dependency latency and failures.
+
+4. Runtime
+   - goroutines;
+   - heap allocation;
+   - GC duration;
+   - process CPU;
+   - process memory.
+
+Do not add a panel merely because a metric exists.
+Each panel must answer a concrete operational question.
+
+## Prometheus rules
+
+- Use `$__rate_interval` for rate and increase queries unless another
+  interval is intentionally required.
+- Apply `rate()` only to counters.
+- Do not apply `rate()` to gauges.
+- Use `histogram_quantile()` with histogram buckets for latency percentiles.
+- Aggregate buckets by `le` and by every label needed in the legend.
+- Avoid unbounded or high-cardinality dashboard variables.
+- Do not group by identifiers such as message_id, user_id, request_id,
+  task_id or trace_id.
+- Preserve important labels such as service, instance, operation, status
+  and queue only when they exist on the metric.
+- Prefer recording rules when the same expensive query is repeated.
+- Use stable datasource UIDs rather than datasource names.
+
+## Layout
+
+- Use stable dashboard UIDs.
+- Use deterministic panel order.
+- Use reusable row and panel builders.
+- Use consistent panel heights.
+- Put the most important overview panels above the fold.
+- Use units appropriate to the metric.
+- Add thresholds only when they represent meaningful operational states.
+- Prefer readable legends over raw label sets.
+- Avoid more than approximately 8-10 visible series in one panel.
+
+## Generated files
+
+- Generation must be deterministic.
+- Do not include timestamps or random identifiers in generated output.
+- Do not write environment-specific URLs into dashboard definitions.
+- Datasource UIDs and environment-specific values must be configurable.
+- Generated JSON may be committed for provisioning and review, but it
+  must never be treated as editable source code.
+
+## Verification commands
+
+Run the repository-provided commands, normally:
+
+```bash
+go test ./...
+go run ./cmd/generate
+git diff --exit-code -- generated
+
+When a local Grafana environment is available, verify that the dashboard:
+
+is successfully provisioned;
+has no panel query errors;
+has valid datasource references;
+displays data for the selected time range;
+handles empty data without misleading values.

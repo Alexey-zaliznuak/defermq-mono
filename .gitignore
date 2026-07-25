@@ -1,0 +1,35 @@
+# Локальная конфигурация и секреты
+.env
+.env.*
+!.env.example
+
+# Go
+/bin/
+/build/
+/dist/
+/vendor/
+*.exe
+*.test
+*.out
+coverage/
+coverage.*
+profile.*
+
+# Логи и временные файлы
+*.log
+/tmp/
+/temp/
+.cache/
+
+# IDE и ОС
+.idea/
+.vscode/
+.fleet/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Локальные данные инфраструктуры
+data/
+*.pid
