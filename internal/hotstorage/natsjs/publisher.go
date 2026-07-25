@@ -16,8 +16,8 @@ import (
 type OutboxKind string
 
 const (
-	OutboxSchedule OutboxKind = "schedule"
-	OutboxReady    OutboxKind = "ready"
+	OutboxHotRegister OutboxKind = "hot_register"
+	OutboxReady       OutboxKind = "ready"
 )
 
 type PublishRequest struct {
@@ -39,6 +39,10 @@ type AckPublisher interface {
 	PublishMsg(context.Context, *nats.Msg, ...jetstream.PublishOpt) (*jetstream.PubAck, error)
 }
 
+type AsyncAckPublisher interface {
+	PublishMsgAsync(*nats.Msg, ...jetstream.PublishOpt) (jetstream.PubAckFuture, error)
+}
+
 type Publisher struct {
 	js       AckPublisher
 	subjects Subjects
@@ -49,7 +53,7 @@ func NewPublisher(js AckPublisher, subjects Subjects) *Publisher {
 	return &Publisher{js: js, subjects: subjects, now: time.Now}
 }
 
-func (p *Publisher) Decide(req PublishRequest, now time.Time) (PublishDecision, error) {
+func (p *Publisher) Decide(req PublishRequest, _ time.Time) (PublishDecision, error) {
 	if req.DeliveryID == uuid.Nil || req.ScheduleRevision <= 0 || req.DeliverAt.IsZero() {
 		return PublishDecision{}, errors.New("invalid publish request")
 	}
@@ -62,22 +66,81 @@ func (p *Publisher) Decide(req PublishRequest, now time.Time) (PublishDecision, 
 			Subject:   p.subjects.Ready(req.DestinationType),
 			MessageID: MessageID(req.DeliveryID, req.ScheduleRevision, string(OutboxReady)),
 		}, nil
-	case OutboxSchedule:
-		if !req.DeliverAt.After(now) {
-			return PublishDecision{
-				Subject:   p.subjects.Ready(req.DestinationType),
-				MessageID: MessageID(req.DeliveryID, req.ScheduleRevision, string(OutboxReady)),
-			}, nil
-		}
-		return PublishDecision{
-			Subject:   p.subjects.Schedule(req.DeliveryID),
-			MessageID: MessageID(req.DeliveryID, req.ScheduleRevision, string(OutboxSchedule)),
-			Scheduled: true,
-			Target:    p.subjects.Ready(req.DestinationType),
-		}, nil
 	default:
 		return PublishDecision{}, fmt.Errorf("invalid outbox kind %q", req.Kind)
 	}
+}
+
+// PublishReadyBatch starts all publishes before awaiting their PubAcks. It
+// returns the requests durably acknowledged by JetStream even when peers fail.
+func (p *Publisher) PublishReadyBatch(
+	ctx context.Context,
+	requests []PublishRequest,
+) ([]PublishRequest, error) {
+	async, ok := p.js.(AsyncAckPublisher)
+	if !ok {
+		return nil, errors.New("JetStream publisher does not support async PubAck")
+	}
+	type pending struct {
+		request PublishRequest
+		future  jetstream.PubAckFuture
+	}
+	pendingAcks := make([]pending, 0, len(requests))
+	var failures []error
+	for _, request := range requests {
+		if request.Kind != OutboxReady {
+			failures = append(failures, fmt.Errorf("batch contains non-ready kind %q", request.Kind))
+			continue
+		}
+		msg, err := p.message(request)
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		future, err := async.PublishMsgAsync(msg, jetstream.WithMsgID(
+			MessageID(request.DeliveryID, request.ScheduleRevision, string(OutboxReady)),
+		))
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		pendingAcks = append(pendingAcks, pending{request: request, future: future})
+	}
+	published := make([]PublishRequest, 0, len(pendingAcks))
+	for _, item := range pendingAcks {
+		select {
+		case ack := <-item.future.Ok():
+			if ack == nil || ack.Stream == "" {
+				failures = append(failures, errors.New("JetStream async publish returned an empty PubAck"))
+			} else {
+				published = append(published, item.request)
+			}
+		case err := <-item.future.Err():
+			failures = append(failures, err)
+		case <-ctx.Done():
+			failures = append(failures, ctx.Err())
+		}
+	}
+	return published, errors.Join(failures...)
+}
+
+func (p *Publisher) message(req PublishRequest) (*nats.Msg, error) {
+	decision, err := p.Decide(req, p.now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	event := ReadyEvent{
+		SchemaVersion: EventSchemaVersion, DeliveryID: req.DeliveryID,
+		ScheduleRevision: req.ScheduleRevision, DeliverAt: req.DeliverAt.UTC(),
+		DestinationType: req.DestinationType,
+	}
+	body, err := json.Marshal(event)
+	if err != nil {
+		return nil, fmt.Errorf("encode ready event: %w", err)
+	}
+	msg := nats.NewMsg(decision.Subject)
+	msg.Data = body
+	return msg, nil
 }
 
 func (p *Publisher) Publish(ctx context.Context, req PublishRequest) error {
@@ -85,22 +148,9 @@ func (p *Publisher) Publish(ctx context.Context, req PublishRequest) error {
 	if err != nil {
 		return err
 	}
-	event := ReadyEvent{
-		SchemaVersion:    EventSchemaVersion,
-		DeliveryID:       req.DeliveryID,
-		ScheduleRevision: req.ScheduleRevision,
-		DeliverAt:        req.DeliverAt.UTC(),
-		DestinationType:  req.DestinationType,
-	}
-	body, err := json.Marshal(event)
+	msg, err := p.message(req)
 	if err != nil {
-		return fmt.Errorf("encode ready event: %w", err)
-	}
-	msg := nats.NewMsg(decision.Subject)
-	msg.Data = body
-	if decision.Scheduled {
-		msg.Header.Set(jetstream.ScheduleHeader, "@at "+req.DeliverAt.UTC().Format(time.RFC3339Nano))
-		msg.Header.Set(jetstream.ScheduleTargetHeader, decision.Target)
+		return err
 	}
 	ack, err := p.js.PublishMsg(ctx, msg, jetstream.WithMsgID(decision.MessageID))
 	if err != nil {

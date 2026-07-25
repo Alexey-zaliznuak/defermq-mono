@@ -22,10 +22,13 @@ func TestHandleDoesNotClaimEarlyEvent(t *testing.T) {
 	pool.now = func() time.Time { return now }
 	message := eventMessage(t, now.Add(time.Minute))
 
-	pool.handle(context.Background(), 0, message)
+	jobs := pool.claimMessages(context.Background(), context.Background(), []Message{message})
 
 	if repository.claimCalls != 0 {
 		t.Fatalf("claim calls = %d, want 0", repository.claimCalls)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("jobs = %d, want 0", len(jobs))
 	}
 	if message.nakDelay != time.Minute || message.acked || message.termed {
 		t.Fatalf("message state: ack=%v term=%v nak=%s", message.acked, message.termed, message.nakDelay)
@@ -41,7 +44,11 @@ func TestHandleACKsOnlyAfterSuccessCommit(t *testing.T) {
 	message := eventMessage(t, now)
 	message.committed = func() bool { return repository.delivered }
 
-	pool.handle(context.Background(), 0, message)
+	jobs := pool.claimMessages(context.Background(), context.Background(), []Message{message})
+	if len(jobs) != 1 {
+		t.Fatalf("claimed jobs = %d, want 1", len(jobs))
+	}
+	pool.handleClaimed(context.Background(), 0, jobs[0])
 
 	if !repository.delivered {
 		t.Fatal("delivery was not committed")
@@ -58,13 +65,141 @@ func TestHandleSchedulesRetryForTypedError(t *testing.T) {
 	pool := newTestPool(t, repository, adapter)
 	message := eventMessage(t, now)
 
-	pool.handle(context.Background(), 0, message)
+	jobs := pool.claimMessages(context.Background(), context.Background(), []Message{message})
+	if len(jobs) != 1 {
+		t.Fatalf("claimed jobs = %d, want 1", len(jobs))
+	}
+	pool.handleClaimed(context.Background(), 0, jobs[0])
 
 	if !repository.retried || repository.dead {
 		t.Fatalf("retry=%v dead=%v", repository.retried, repository.dead)
 	}
 	if !message.acked {
 		t.Fatal("message was not ACKed after retry commit")
+	}
+}
+
+func TestClaimMessagesBatchesAndRoutesOutcomes(t *testing.T) {
+	deliverAt := time.Now().UTC().Add(-time.Second)
+	claimed := successfulRepository(t, deliverAt).claim
+	repository := &fakeRepository{claims: []ClaimResult{
+		claimed,
+		{Reason: ClaimStale},
+		{Reason: ClaimTooEarly, Wait: 250 * time.Millisecond},
+		{Reason: ClaimTerminal},
+	}}
+	pool := newTestPool(t, repository, nil)
+	messages := []*fakeMessage{
+		eventMessage(t, deliverAt),
+		eventMessage(t, deliverAt),
+		eventMessage(t, deliverAt),
+		eventMessage(t, deliverAt),
+	}
+	input := make([]Message, len(messages))
+	for index := range messages {
+		input[index] = messages[index]
+	}
+
+	jobs := pool.claimMessages(context.Background(), context.Background(), input)
+
+	if repository.claimCalls != 1 || len(repository.lastRequests) != len(messages) {
+		t.Fatalf("batch calls=%d requests=%d", repository.claimCalls, len(repository.lastRequests))
+	}
+	if len(jobs) != 1 || jobs[0].message != messages[0] {
+		t.Fatalf("claimed jobs = %#v", jobs)
+	}
+	if !messages[1].acked || !messages[3].acked {
+		t.Fatal("stale and terminal events were not ACKed")
+	}
+	if messages[2].nakDelay != 250*time.Millisecond {
+		t.Fatalf("too-early NAK delay = %s", messages[2].nakDelay)
+	}
+	if messages[0].acked || messages[0].nakDelay != 0 {
+		t.Fatal("claimed event was acknowledged before worker transition")
+	}
+}
+
+func TestClaimMessagesNAKsWholeBatchOnError(t *testing.T) {
+	repository := &fakeRepository{claimError: errors.New("database unavailable")}
+	pool := newTestPool(t, repository, nil)
+	deliverAt := time.Now().UTC().Add(-time.Second)
+	first := eventMessage(t, deliverAt)
+	second := eventMessage(t, deliverAt)
+
+	jobs := pool.claimMessages(
+		context.Background(), context.Background(), []Message{first, second},
+	)
+
+	if len(jobs) != 0 || repository.claimCalls != 1 {
+		t.Fatalf("jobs=%d claim calls=%d", len(jobs), repository.claimCalls)
+	}
+	if first.nakDelay != time.Second || second.nakDelay != time.Second {
+		t.Fatalf("batch NAK delays = %s, %s", first.nakDelay, second.nakDelay)
+	}
+}
+
+func TestRunCollectsMessagesUpToFetchBatchSize(t *testing.T) {
+	deliverAt := time.Now().UTC().Add(-time.Second)
+	messages := []*fakeMessage{
+		eventMessage(t, deliverAt),
+		eventMessage(t, deliverAt),
+		eventMessage(t, deliverAt),
+		eventMessage(t, deliverAt),
+	}
+	input := make([]Message, len(messages))
+	for index := range messages {
+		input[index] = messages[index]
+	}
+	consumer := &batchConsumer{messages: input}
+	ctx, cancel := context.WithCancel(context.Background())
+	repository := &fakeRepository{
+		claims: []ClaimResult{
+			{Reason: ClaimStale},
+			{Reason: ClaimStale},
+			{Reason: ClaimStale},
+		},
+		onClaim: func([]ClaimRequest) { cancel() },
+	}
+	dispatcher, err := delivery.NewDispatcher(&fakeAdapter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := NewPool(PoolConfig{
+		Workers:            1,
+		QueueSize:          3,
+		FetchBatchSize:     3,
+		FetchMaxWait:       time.Second,
+		ClaimBatchSize:     10,
+		ClaimFlushInterval: time.Second,
+		ProcessingLease:    2 * time.Hour,
+		HeartbeatInterval:  time.Hour,
+		ClockSkewTolerance: 10 * time.Millisecond,
+		MaxPayloadBytes:    1024,
+		HotHorizon:         time.Minute,
+		TransitionRetry:    time.Second,
+		ShutdownTimeout:    time.Second,
+	}, "test-owner", consumer, repository, dispatcher, delivery.Backoff{
+		Initial: time.Second, Multiplier: 2, Max: time.Minute, Jitter: delivery.JitterNone,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := pool.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if repository.claimCalls != 1 || len(repository.lastRequests) != 3 {
+		t.Fatalf("batch calls=%d requests=%d, want 1 call with 3 requests",
+			repository.claimCalls, len(repository.lastRequests))
+	}
+	for index := 0; index < 3; index++ {
+		if !messages[index].acked {
+			t.Errorf("message %d was not ACKed", index)
+		}
+	}
+	if messages[3].acked || messages[3].termed || messages[3].nakDelay != 0 {
+		t.Fatal("message beyond fetch batch limit was consumed")
 	}
 }
 
@@ -90,6 +225,8 @@ func newTestPool(t *testing.T, repository *fakeRepository, adapter *fakeAdapter)
 		QueueSize:          1,
 		FetchBatchSize:     1,
 		FetchMaxWait:       time.Second,
+		ClaimBatchSize:     100,
+		ClaimFlushInterval: 10 * time.Millisecond,
 		ProcessingLease:    2 * time.Hour,
 		HeartbeatInterval:  time.Hour,
 		ClockSkewTolerance: 10 * time.Millisecond,
@@ -125,8 +262,9 @@ func successfulRepository(t *testing.T, scheduledAt time.Time) *fakeRepository {
 			ScheduleRevision: 1,
 			Attempts:         1,
 			MaxAttempts:      3,
+		}, Payload: &domain.Payload{
+			Body: []byte("body"), ContentType: "text/plain", SizeBytes: 4,
 		}},
-		payload: domain.Payload{Body: []byte("body"), ContentType: "text/plain"},
 	}
 }
 
@@ -149,11 +287,29 @@ func eventMessage(t *testing.T, deliverAt time.Time) *fakeMessage {
 type fakeConsumer struct{}
 
 func (fakeConsumer) Type() domain.DestinationType { return domain.DestinationHTTP }
-func (fakeConsumer) Fetch(context.Context, int, time.Duration) ([]Message, error) {
+func (fakeConsumer) Next(context.Context) (Message, error) {
 	return nil, nil
 }
 func (fakeConsumer) Ready(context.Context) error { return nil }
 func (fakeConsumer) Close(context.Context) error { return nil }
+
+type batchConsumer struct {
+	messages []Message
+	next     int
+}
+
+func (*batchConsumer) Type() domain.DestinationType { return domain.DestinationHTTP }
+func (c *batchConsumer) Next(ctx context.Context) (Message, error) {
+	if c.next < len(c.messages) {
+		message := c.messages[c.next]
+		c.next++
+		return message, nil
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (*batchConsumer) Ready(context.Context) error { return nil }
+func (*batchConsumer) Close(context.Context) error { return nil }
 
 type fakeMessage struct {
 	data           []byte
@@ -193,20 +349,40 @@ func (a *fakeAdapter) Ready(context.Context) error { return nil }
 func (a *fakeAdapter) Close(context.Context) error { return nil }
 
 type fakeRepository struct {
-	claimCalls int
-	claim      ClaimResult
-	payload    domain.Payload
-	delivered  bool
-	retried    bool
-	dead       bool
+	claimCalls   int
+	claim        ClaimResult
+	claims       []ClaimResult
+	claimError   error
+	onClaim      func([]ClaimRequest)
+	lastRequests []ClaimRequest
+	delivered    bool
+	retried      bool
+	dead         bool
 }
 
-func (r *fakeRepository) Claim(context.Context, uuid.UUID, int64, string, time.Duration, time.Duration) (ClaimResult, error) {
+func (r *fakeRepository) ClaimBatch(
+	_ context.Context,
+	requests []ClaimRequest,
+	_ string,
+	_ time.Duration,
+	_ time.Duration,
+) ([]ClaimResult, error) {
 	r.claimCalls++
-	return r.claim, nil
-}
-func (r *fakeRepository) LoadPayload(context.Context, uuid.UUID, int64) (domain.Payload, error) {
-	return r.payload, nil
+	r.lastRequests = append([]ClaimRequest(nil), requests...)
+	if r.onClaim != nil {
+		r.onClaim(requests)
+	}
+	if r.claimError != nil {
+		return nil, r.claimError
+	}
+	if r.claims != nil {
+		return r.claims, nil
+	}
+	results := make([]ClaimResult, len(requests))
+	for index := range results {
+		results[index] = r.claim
+	}
+	return results, nil
 }
 func (r *fakeRepository) Heartbeat(context.Context, uuid.UUID, string, time.Duration) (bool, error) {
 	return true, nil

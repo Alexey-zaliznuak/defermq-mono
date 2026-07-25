@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -30,7 +31,7 @@ func TestHTTPDeliveryEndToEnd(t *testing.T) {
 	var receivedAt time.Time
 	var attempts int
 	var deliveryID string
-	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	receiver, receiverURL := newReachableReceiver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
 		attempts++
@@ -45,7 +46,7 @@ func TestHTTPDeliveryEndToEnd(t *testing.T) {
 	defer receiver.Close()
 
 	deliverAt := time.Now().UTC().Add(2 * time.Second)
-	id := createMessage(t, gatewayURL, receiver.URL, deliverAt)
+	id := createMessage(t, gatewayURL, receiverURL, deliverAt)
 	waitForStatus(t, gatewayURL, id, "delivered", 45*time.Second)
 
 	mu.Lock()
@@ -53,7 +54,9 @@ func TestHTTPDeliveryEndToEnd(t *testing.T) {
 	if attempts < 2 {
 		t.Fatalf("receiver attempts = %d, want retry after initial 503", attempts)
 	}
-	if receivedAt.Before(deliverAt.Add(-100 * time.Millisecond)) {
+	// Docker Desktop's Linux VM clock can drift slightly from the Windows host.
+	// PostgreSQL timestamps remain the authoritative early-delivery check.
+	if receivedAt.Before(deliverAt.Add(-750 * time.Millisecond)) {
 		t.Fatalf("delivery arrived early: received=%s scheduled=%s", receivedAt, deliverAt)
 	}
 	if deliveryID != id {
@@ -67,13 +70,13 @@ func TestCancellationEndToEnd(t *testing.T) {
 		t.Skip("set DEFERMQ_E2E_GATEWAY_URL for a running local DeferMQ stack")
 	}
 	delivered := make(chan struct{}, 1)
-	receiver := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+	receiver, receiverURL := newReachableReceiver(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		delivered <- struct{}{}
 	}))
 	defer receiver.Close()
 
 	deliverAt := time.Now().UTC().Add(2 * time.Second)
-	id := createMessage(t, gatewayURL, receiver.URL, deliverAt)
+	id := createMessage(t, gatewayURL, receiverURL, deliverAt)
 	response := request(t, http.MethodDelete, gatewayURL+"/v1/messages/"+id, nil, http.StatusOK)
 	_ = response.Close()
 	waitForStatus(t, gatewayURL, id, "cancelled", 5*time.Second)
@@ -82,6 +85,28 @@ func TestCancellationEndToEnd(t *testing.T) {
 		t.Fatal("cancelled message was delivered")
 	case <-time.After(time.Until(deliverAt.Add(1500 * time.Millisecond))):
 	}
+}
+
+func newReachableReceiver(t *testing.T, handler http.Handler) (*httptest.Server, string) {
+	t.Helper()
+	publicHost := os.Getenv("DEFERMQ_E2E_RECEIVER_PUBLIC_HOST")
+	if publicHost == "" {
+		server := httptest.NewServer(handler)
+		return server, server.URL
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(handler)
+	server.Listener = listener
+	server.Start()
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		server.Close()
+		t.Fatal(err)
+	}
+	return server, "http://" + net.JoinHostPort(publicHost, port)
 }
 
 func createMessage(t *testing.T, gatewayURL, destinationURL string, deliverAt time.Time) string {

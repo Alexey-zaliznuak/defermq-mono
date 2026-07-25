@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -10,6 +11,215 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
+
+// ClaimDeliveriesBatch locks all requested deliveries in UUID order and
+// atomically claims every eligible delivery. Results retain input order.
+func (s *Store) ClaimDeliveriesBatch(
+	ctx context.Context,
+	requests []ClaimRequest,
+	owner string,
+	lease time.Duration,
+	tolerance time.Duration,
+) ([]BatchClaimResult, error) {
+	if len(requests) == 0 {
+		return []BatchClaimResult{}, nil
+	}
+	if owner == "" || lease <= 0 || tolerance < 0 {
+		return nil, errors.New("invalid batch delivery claim parameters")
+	}
+	ids := make([]uuid.UUID, len(requests))
+	revisions := make([]int64, len(requests))
+	for index, request := range requests {
+		if request.DeliveryID == uuid.Nil || request.ScheduleRevision <= 0 {
+			return nil, errors.New("invalid batch delivery claim request")
+		}
+		ids[index] = request.DeliveryID
+		revisions[index] = request.ScheduleRevision
+	}
+
+	ctx, cancel := s.withTimeout(ctx)
+	defer cancel()
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("begin batch delivery claim: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	rows, err := tx.Query(ctx, `
+		WITH requested AS MATERIALIZED (
+			SELECT input.id, input.revision, input.ordinality::bigint AS ord
+			FROM unnest($1::uuid[], $2::bigint[]) WITH ORDINALITY
+				AS input(id, revision, ordinality)
+		), requested_ids AS MATERIALIZED (
+			SELECT id
+			FROM requested
+			GROUP BY id
+			ORDER BY id
+		), db_time AS MATERIALIZED (
+			SELECT clock_timestamp() AS now
+		), locked_deliveries AS MATERIALIZED (
+			SELECT d.*
+			FROM deliveries d
+			JOIN requested_ids requested_id ON requested_id.id = d.id
+			ORDER BY d.id
+			FOR UPDATE OF d
+		), eligible AS MATERIALIZED (
+			SELECT DISTINCT ON (d.id) d.id, r.ord
+			FROM locked_deliveries d
+			JOIN requested r
+			  ON r.id = d.id
+			 AND r.revision = d.schedule_revision
+			CROSS JOIN db_time t
+			WHERE d.status = 'scheduled'
+			  AND d.deliver_at <= t.now + $5 * interval '1 millisecond'
+			ORDER BY d.id, r.ord
+		), updated AS MATERIALIZED (
+			UPDATE deliveries d
+			SET status = 'processing',
+				processing_owner = $3,
+				processing_until = t.now + $4 * interval '1 millisecond',
+				attempts = d.attempts + 1,
+				last_attempt_at = t.now,
+				updated_at = t.now
+			FROM eligible e
+			CROSS JOIN db_time t
+			WHERE d.id = e.id
+			RETURNING d.*, e.ord
+		)
+		SELECT r.ord,
+			CASE
+				WHEN u.id IS NOT NULL THEN 'claimed'
+				WHEN e.id IS NOT NULL THEN 'processing'
+				WHEN d.id IS NULL THEN 'not_found'
+				WHEN d.schedule_revision <> r.revision THEN 'stale_revision'
+				WHEN d.status IN ('delivered', 'cancelled', 'dead') THEN 'terminal'
+				WHEN d.status = 'processing' THEN 'processing'
+				WHEN d.deliver_at > t.now + $5 * interval '1 millisecond' THEN 'too_early'
+				ELSE 'stale_revision'
+			END AS reason,
+			CASE WHEN d.deliver_at IS NULL THEN 0
+				ELSE GREATEST(0, EXTRACT(EPOCH FROM (d.deliver_at - t.now)) * 1000)
+			END AS wait_ms,
+			CASE WHEN u.id IS NULL THEN NULL ELSE to_jsonb(u) - 'ord' END AS delivery,
+			p.id, p.body, p.headers, p.content_type, p.size_bytes, p.created_at
+		FROM requested r
+		CROSS JOIN db_time t
+		LEFT JOIN locked_deliveries d ON d.id = r.id
+		LEFT JOIN eligible e ON e.id = r.id
+		LEFT JOIN updated u ON u.ord = r.ord
+		LEFT JOIN message_payloads p ON p.id = u.payload_id
+		ORDER BY r.ord`,
+		ids, revisions, owner, durationMillis(lease), durationMillis(tolerance))
+	if err != nil {
+		return nil, fmt.Errorf("batch claim deliveries: %w", err)
+	}
+	defer rows.Close()
+
+	results := make([]BatchClaimResult, 0, len(requests))
+	for rows.Next() {
+		var (
+			ordinal     int64
+			reason      string
+			waitMillis  float64
+			deliveryRaw []byte
+			payloadID   *uuid.UUID
+			body        []byte
+			headersRaw  []byte
+			contentType *string
+			sizeBytes   *int64
+			createdAt   *time.Time
+		)
+		if err := rows.Scan(
+			&ordinal, &reason, &waitMillis, &deliveryRaw,
+			&payloadID, &body, &headersRaw, &contentType, &sizeBytes, &createdAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan batch delivery claim: %w", err)
+		}
+		result, err := decodeBatchClaimRow(
+			reason, time.Duration(waitMillis*float64(time.Millisecond)), deliveryRaw,
+			payloadID, body, headersRaw, contentType, sizeBytes, createdAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("decode batch delivery claim at ordinal %d: %w", ordinal, err)
+		}
+		results = append(results, result)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read batch delivery claims: %w", err)
+	}
+	if len(results) != len(requests) {
+		return nil, fmt.Errorf("batch delivery claim returned %d results for %d requests", len(results), len(requests))
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit batch delivery claim: %w", err)
+	}
+	return results, nil
+}
+
+type batchDeliveryJSON struct {
+	ID                    uuid.UUID              `json:"id"`
+	PayloadID             uuid.UUID              `json:"payload_id"`
+	IdempotencyKey        *string                `json:"idempotency_key"`
+	DestinationType       domain.DestinationType `json:"destination_type"`
+	Destination           json.RawMessage        `json:"destination"`
+	DeliverAt             time.Time              `json:"deliver_at"`
+	Status                domain.DeliveryStatus  `json:"status"`
+	ScheduleRevision      int64                  `json:"schedule_revision"`
+	HotRegisteredRevision *int64                 `json:"hot_registered_revision"`
+	Attempts              int                    `json:"attempts"`
+	MaxAttempts           int                    `json:"max_attempts"`
+	ProcessingOwner       *string                `json:"processing_owner"`
+	ProcessingUntil       *time.Time             `json:"processing_until"`
+	LastError             *string                `json:"last_error"`
+	LastAttemptAt         *time.Time             `json:"last_attempt_at"`
+	DeliveredAt           *time.Time             `json:"delivered_at"`
+	CancelledAt           *time.Time             `json:"cancelled_at"`
+	CreatedAt             time.Time              `json:"created_at"`
+	UpdatedAt             time.Time              `json:"updated_at"`
+}
+
+func decodeBatchClaimRow(
+	reason string,
+	wait time.Duration,
+	deliveryRaw []byte,
+	payloadID *uuid.UUID,
+	body []byte,
+	headersRaw []byte,
+	contentType *string,
+	sizeBytes *int64,
+	createdAt *time.Time,
+) (BatchClaimResult, error) {
+	if reason != "claimed" {
+		return BatchClaimResult{Reason: reason, Wait: wait}, nil
+	}
+	if len(deliveryRaw) == 0 || payloadID == nil || contentType == nil || sizeBytes == nil || createdAt == nil {
+		return BatchClaimResult{}, errors.New("claimed delivery is missing delivery or payload data")
+	}
+	var encoded batchDeliveryJSON
+	if err := json.Unmarshal(deliveryRaw, &encoded); err != nil {
+		return BatchClaimResult{}, fmt.Errorf("decode delivery: %w", err)
+	}
+	var headers map[string]string
+	if err := json.Unmarshal(headersRaw, &headers); err != nil {
+		return BatchClaimResult{}, fmt.Errorf("decode payload headers: %w", err)
+	}
+	delivery := domain.Delivery{
+		ID: encoded.ID, PayloadID: encoded.PayloadID, IdempotencyKey: encoded.IdempotencyKey,
+		DestinationType: encoded.DestinationType, Destination: encoded.Destination,
+		DeliverAt: encoded.DeliverAt.UTC(), Status: encoded.Status,
+		ScheduleRevision: encoded.ScheduleRevision, HotRegisteredRevision: encoded.HotRegisteredRevision,
+		Attempts: encoded.Attempts, MaxAttempts: encoded.MaxAttempts,
+		ProcessingOwner: encoded.ProcessingOwner, ProcessingUntil: encoded.ProcessingUntil,
+		LastError: encoded.LastError, LastAttemptAt: encoded.LastAttemptAt,
+		DeliveredAt: encoded.DeliveredAt, CancelledAt: encoded.CancelledAt,
+		CreatedAt: encoded.CreatedAt.UTC(), UpdatedAt: encoded.UpdatedAt.UTC(),
+	}
+	payload := domain.Payload{
+		ID: *payloadID, Body: body, Headers: headers, ContentType: *contentType,
+		SizeBytes: *sizeBytes, CreatedAt: createdAt.UTC(),
+	}
+	return BatchClaimResult{Delivery: &delivery, Payload: &payload, Reason: reason}, nil
+}
 
 // ClaimDelivery atomically fences a ready event by revision and takes a
 // processing lease. A rejected claim is returned as classification data rather

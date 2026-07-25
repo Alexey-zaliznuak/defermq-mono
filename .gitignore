@@ -14,6 +14,7 @@
 coverage/
 coverage.*
 profile.*
+/test-results/
 
 # Логи и временные файлы
 *.log

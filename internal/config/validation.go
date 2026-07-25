@@ -60,7 +60,7 @@ func (c Config) Validate() error {
 	positiveDuration(&errs, "DEFERMQ_POSTGRES_QUERY_TIMEOUT", c.Postgres.QueryTimeout)
 	positiveDuration(&errs, "DEFERMQ_POSTGRES_METRICS_QUERY_TIMEOUT", c.Postgres.MetricsQueryTimeout)
 
-	if c.Service == ServiceManager || c.Service == ServicePusher {
+	if c.Service == ServiceGateway || c.Service == ServiceManager || c.Service == ServicePusher {
 		if err := validateURL(c.NATS.URL, "nats", "tls", "ws", "wss"); err != nil {
 			errs = append(errs, fmt.Errorf("DEFERMQ_NATS_URL: %w", err))
 		}
@@ -73,7 +73,10 @@ func (c Config) Validate() error {
 	if c.NATS.MaxReconnects < -1 || c.NATS.StreamReplicas <= 0 || c.NATS.StreamMaxBytes <= 0 || c.NATS.StreamMaxMessageSize <= 0 {
 		errs = append(errs, errors.New("NATS numeric limits are invalid"))
 	}
-	if strings.TrimSpace(c.NATS.Stream) == "" || !validSubjectPrefix(c.NATS.ScheduleSubjectPrefix) || !validSubjectPrefix(c.NATS.ReadySubjectPrefix) {
+	if strings.TrimSpace(c.NATS.Stream) == "" || strings.TrimSpace(c.NATS.IngestStream) == "" ||
+		strings.TrimSpace(c.NATS.IngestPendingBucket) == "" ||
+		!validSubjectPrefix(c.NATS.ScheduleSubjectPrefix) || !validSubjectPrefix(c.NATS.ReadySubjectPrefix) ||
+		!validSubjectPrefix(c.NATS.IngestSubject) {
 		errs = append(errs, errors.New("NATS stream and subject prefixes must be non-empty and contain no wildcards"))
 	}
 	if c.NATS.CredentialsFile != "" && (c.NATS.User != "" || c.NATS.Password != "") {
@@ -106,9 +109,11 @@ func validateGateway(errs *[]error, c GatewayConfig) {
 	} {
 		positiveDuration(errs, name, value)
 	}
-	if c.MaxHeaderBytes <= 0 || c.DefaultMaxAttempts <= 0 || c.MaxIdempotencyKeyBytes <= 0 {
+	if c.MaxHeaderBytes <= 0 || c.DefaultMaxAttempts <= 0 || c.MaxIdempotencyKeyBytes <= 0 ||
+		c.IngestBatchSize <= 0 || c.IngestQueueCapacity < c.IngestBatchSize || c.IngestShardCount <= 0 {
 		*errs = append(*errs, errors.New("Gateway integer limits must be positive"))
 	}
+	positiveDuration(errs, "DEFERMQ_GATEWAY_INGEST_FLUSH_INTERVAL", c.IngestFlushInterval)
 }
 
 func validateManager(errs *[]error, c Manager) {
@@ -118,7 +123,12 @@ func validateManager(errs *[]error, c Manager) {
 	for name, value := range map[string]int{
 		"DEFERMQ_MANAGER_PROMOTER_BATCH_SIZE": c.PromoterBatchSize, "DEFERMQ_MANAGER_OUTBOX_WORKERS": c.OutboxWorkers,
 		"DEFERMQ_MANAGER_OUTBOX_BATCH_SIZE": c.OutboxBatchSize, "DEFERMQ_MANAGER_OVERDUE_BATCH_SIZE": c.OverdueBatchSize,
-		"DEFERMQ_MANAGER_RETENTION_BATCH_SIZE": c.RetentionBatchSize,
+		"DEFERMQ_MANAGER_RETENTION_BATCH_SIZE":   c.RetentionBatchSize,
+		"DEFERMQ_MANAGER_INGEST_WORKERS":         c.IngestWorkers,
+		"DEFERMQ_MANAGER_INGEST_SHARDS":          c.IngestShards,
+		"DEFERMQ_MANAGER_INGEST_BATCH_SIZE":      c.IngestBatchSize,
+		"DEFERMQ_MANAGER_INGEST_MAX_ACK_PENDING": c.IngestMaxAckPending,
+		"DEFERMQ_MANAGER_INGEST_MAX_DELIVER":     c.IngestMaxDeliver,
 	} {
 		if value <= 0 {
 			*errs = append(*errs, fmt.Errorf("%s must be positive", name))
@@ -131,6 +141,7 @@ func validateManager(errs *[]error, c Manager) {
 		"DEFERMQ_MANAGER_OVERDUE_INTERVAL": c.OverdueInterval, "DEFERMQ_MANAGER_REAPER_INTERVAL": c.ReaperInterval,
 		"DEFERMQ_MANAGER_RETENTION_INTERVAL": c.RetentionInterval, "DEFERMQ_MANAGER_TERMINAL_RETENTION": c.TerminalRetention,
 		"DEFERMQ_MANAGER_OUTBOX_RETENTION": c.OutboxRetention, "DEFERMQ_MANAGER_METRICS_COLLECTION_INTERVAL": c.MetricsCollectionInterval,
+		"DEFERMQ_MANAGER_INGEST_FLUSH_INTERVAL": c.IngestFlushInterval, "DEFERMQ_MANAGER_INGEST_ACK_WAIT": c.IngestAckWait,
 	} {
 		positiveDuration(errs, name, value)
 	}
@@ -139,6 +150,12 @@ func validateManager(errs *[]error, c Manager) {
 	if c.OutboxRetryInitial > c.OutboxRetryMax {
 		*errs = append(*errs, errors.New("Manager outbox retry initial must not exceed retry max"))
 	}
+	if c.IngestMaxAckPending < c.IngestBatchSize {
+		*errs = append(*errs, errors.New("Manager ingest max ack pending must cover one batch"))
+	}
+	if c.IngestWorkers > c.IngestShards {
+		*errs = append(*errs, errors.New("Manager ingest workers must not exceed ingest shards"))
+	}
 }
 
 func validatePusher(errs *[]error, c Pusher) {
@@ -146,7 +163,8 @@ func validatePusher(errs *[]error, c Pusher) {
 		*errs = append(*errs, errors.New("DEFERMQ_PUSHER_HTTP_ADDR must not be empty"))
 	}
 	for name, value := range map[string]int{
-		"DEFERMQ_PUSHER_FETCH_BATCH_SIZE": c.FetchBatchSize, "DEFERMQ_PUSHER_WORKERS_HTTP": c.WorkersHTTP,
+		"DEFERMQ_PUSHER_FETCH_BATCH_SIZE": c.FetchBatchSize, "DEFERMQ_PUSHER_CLAIM_BATCH_SIZE": c.ClaimBatchSize,
+		"DEFERMQ_PUSHER_WORKERS_HTTP":  c.WorkersHTTP,
 		"DEFERMQ_PUSHER_WORKERS_KAFKA": c.WorkersKafka, "DEFERMQ_PUSHER_WORKERS_RABBIT": c.WorkersRabbit,
 		"DEFERMQ_PUSHER_WORKERS_POSTGRES": c.WorkersPostgres, "DEFERMQ_PUSHER_MAX_ACK_PENDING": c.MaxAckPending,
 		"DEFERMQ_PUSHER_MAX_DELIVER": c.MaxDeliver,
@@ -157,7 +175,8 @@ func validatePusher(errs *[]error, c Pusher) {
 	}
 	for name, value := range map[string]time.Duration{
 		"DEFERMQ_PUSHER_FETCH_MAX_WAIT": c.FetchMaxWait, "DEFERMQ_PUSHER_ACK_WAIT": c.AckWait,
-		"DEFERMQ_PUSHER_PROCESSING_LEASE": c.ProcessingLease, "DEFERMQ_PUSHER_LEASE_HEARTBEAT_INTERVAL": c.LeaseHeartbeatInterval,
+		"DEFERMQ_PUSHER_CLAIM_FLUSH_INTERVAL": c.ClaimFlushInterval,
+		"DEFERMQ_PUSHER_PROCESSING_LEASE":     c.ProcessingLease, "DEFERMQ_PUSHER_LEASE_HEARTBEAT_INTERVAL": c.LeaseHeartbeatInterval,
 		"DEFERMQ_PUSHER_RETRY_INITIAL_BACKOFF": c.RetryInitialBackoff, "DEFERMQ_PUSHER_RETRY_MAX_BACKOFF": c.RetryMaxBackoff,
 		"DEFERMQ_PUSHER_METRICS_COLLECTION_INTERVAL": c.MetricsCollectionInterval,
 	} {

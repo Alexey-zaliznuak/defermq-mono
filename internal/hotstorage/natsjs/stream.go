@@ -23,7 +23,7 @@ type StreamConfig struct {
 func (c StreamConfig) Desired() jetstream.StreamConfig {
 	return jetstream.StreamConfig{
 		Name:              c.Name,
-		Subjects:          []string{c.Subjects.ScheduleWildcard(), c.Subjects.ReadyWildcard()},
+		Subjects:          []string{c.Subjects.ReadyWildcard()},
 		Retention:         jetstream.LimitsPolicy,
 		Storage:           jetstream.FileStorage,
 		Replicas:          c.Replicas,
@@ -31,7 +31,7 @@ func (c StreamConfig) Desired() jetstream.StreamConfig {
 		MaxBytes:          c.MaxBytes,
 		MaxMsgSize:        c.MaxMsgSize,
 		Duplicates:        c.DuplicateWindow,
-		AllowMsgSchedules: true,
+		AllowMsgSchedules: false,
 	}
 }
 
@@ -103,21 +103,18 @@ func CompatibleStreamConfig(current, desired jetstream.StreamConfig) (jetstream.
 		return current, false, errors.New("PubAck is disabled")
 	}
 	if current.Mirror != nil || len(current.Sources) != 0 {
-		return current, false, errors.New("mirrors and sources cannot host message schedules")
+		return current, false, errors.New("mirrors and sources are not supported")
 	}
 
 	merged := current
 	changed := false
-	for _, subject := range desired.Subjects {
-		if !slices.Contains(merged.Subjects, subject) {
-			merged.Subjects = append(merged.Subjects, subject)
-			changed = true
-		}
-	}
-	if !merged.AllowMsgSchedules {
-		merged.AllowMsgSchedules = true
+	if !slices.Equal(merged.Subjects, desired.Subjects) {
+		merged.Subjects = slices.Clone(desired.Subjects)
 		changed = true
 	}
+	// NATS does not allow disabling message schedules on an existing stream.
+	// Leaving the capability enabled is harmless after schedule subjects are
+	// removed; new streams are still created with schedules disabled.
 	if merged.Replicas < desired.Replicas {
 		merged.Replicas = desired.Replicas
 		changed = true

@@ -6,6 +6,9 @@ vars:
   VERSION: '{{default "dev" .VERSION}}'
   COMMIT: '{{default "unknown" .COMMIT}}'
   BUILD_TIME: '{{default "unknown" .BUILD_TIME}}'
+  LOADTEST_CONFIG: '{{default "configs/loadtest.example.yml" .LOADTEST_CONFIG}}'
+  LOADTEST_SMOKE_CONFIG: '{{default "configs/loadtest.smoke.yml" .LOADTEST_SMOKE_CONFIG}}'
+  LOADTEST_1000RPS_CONFIG: '{{default "configs/loadtest.1000rps.yml" .LOADTEST_1000RPS_CONFIG}}'
   EXT: '{{if eq OS "windows"}}.exe{{end}}'
   LDFLAGS: >-
     -s -w
@@ -40,6 +43,12 @@ tasks:
     cmds:
       - '{{.GO}} test ./...'
 
+  test-unit:
+    desc: Запустить быстрые unit-тесты без внешних сервисов
+    aliases: [unit]
+    cmds:
+      - '{{.GO}} test ./internal/... ./tools/...'
+
   test-race:
     desc: Запустить тесты с race detector
     cmds:
@@ -49,6 +58,59 @@ tasks:
     desc: Запустить opt-in integration-тесты
     cmds:
       - '{{.GO}} test -tags=integration ./...'
+
+  test-core-integration:
+    desc: Запустить PostgreSQL и NATS integration tests против Compose
+    env:
+      DEFERMQ_TEST_POSTGRES_DSN: '{{default "postgres://defermq:defermq@127.0.0.1:55432/defermq?sslmode=disable" .DEFERMQ_TEST_POSTGRES_DSN}}'
+      DEFERMQ_NATS_INTEGRATION_URL: '{{default "nats://127.0.0.1:4222" .DEFERMQ_NATS_INTEGRATION_URL}}'
+    cmds:
+      - '{{.GO}} test -count=1 -timeout=5m ./internal/storage/postgres ./internal/hotstorage/natsjs'
+
+  test-e2e:
+    desc: Запустить HTTP E2E против локального Compose
+    env:
+      DEFERMQ_E2E_GATEWAY_URL: '{{default "http://127.0.0.1:8080" .DEFERMQ_E2E_GATEWAY_URL}}'
+      DEFERMQ_E2E_RECEIVER_PUBLIC_HOST: '{{default "host.docker.internal" .DEFERMQ_E2E_RECEIVER_PUBLIC_HOST}}'
+    cmds:
+      - '{{.GO}} test -count=1 -timeout=5m ./integration'
+
+  load-test:
+    desc: Запустить конфигурируемый load/E2E test и сформировать отчёты
+    cmds:
+      - '{{.GO}} run ./tools/loadtest -config "{{.LOADTEST_CONFIG}}" {{.CLI_ARGS}}'
+
+  load-smoke:
+    desc: Запустить короткий smoke load test
+    aliases: [smoke]
+    cmds:
+      - task: load-test
+        vars:
+          LOADTEST_CONFIG: '{{.LOADTEST_SMOKE_CONFIG}}'
+
+  load-1000rps:
+    desc: Запустить двухминутный профиль 1000 create-запросов в секунду
+    aliases: [1000rps]
+    cmds:
+      - task: load-test
+        vars:
+          LOADTEST_CONFIG: '{{.LOADTEST_1000RPS_CONFIG}}'
+
+  test-fault:
+    desc: Проверить окна отказов ingest, Valkey scheduler и ready outbox
+    aliases: [fault]
+    cmds:
+      - '{{.GO}} test -count=1 ./internal/ingest ./internal/manager ./internal/hotstorage/valkey ./internal/hotstorage/natsjs'
+
+  test-full:
+    desc: Выполнить unit, race, fault, core integration и HTTP E2E без нагрузки
+    aliases: [full]
+    cmds:
+      - task: test-unit
+      - task: test-race
+      - task: test-fault
+      - task: test-core-integration
+      - task: test-e2e
 
   lint:
     desc: Запустить golangci-lint из PATH
@@ -125,6 +187,13 @@ tasks:
     cmds:
       - docker compose -f deploy/compose/docker-compose.build.yml down --remove-orphans
       - docker compose -f deploy/compose/docker-compose.images.yml down --remove-orphans
+
+  config-check:
+    desc: Проверить синтаксис build/images Compose и список Task-команд
+    cmds:
+      - docker compose -f deploy/compose/docker-compose.build.yml config --quiet
+      - docker compose -f deploy/compose/docker-compose.images.yml config --quiet
+      - task --list
 
   migrate-up:
     desc: Применить SQL-миграции утилитой goose

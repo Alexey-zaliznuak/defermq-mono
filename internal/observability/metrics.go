@@ -83,11 +83,21 @@ func NewGatewayMetrics(registerer prometheus.Registerer) *GatewayMetrics {
 }
 
 type ManagerMetrics struct {
+	IngestBatchSize           prometheus.Histogram
+	IngestCommits             *prometheus.CounterVec
+	IngestCommitDuration      *prometheus.HistogramVec
+	IngestRows                *prometheus.CounterVec
+	IngestRedeliveries        prometheus.Counter
+	IngestDLQ                 *prometheus.CounterVec
 	PromoterCycles            *prometheus.CounterVec
 	PromoterBatches           *prometheus.CounterVec
 	PromoterBatchSize         prometheus.Histogram
 	PromoterBatchDuration     prometheus.Histogram
 	PromotedMessages          prometheus.Counter
+	LoopErrors                *prometheus.CounterVec
+	LoopDuration              *prometheus.HistogramVec
+	LoopLastSuccess           *prometheus.GaugeVec
+	LoopLastFullBatch         *prometheus.GaugeVec
 	OutboxClaimed             *prometheus.CounterVec
 	OutboxPublished           *prometheus.CounterVec
 	OutboxPublishDuration     *prometheus.HistogramVec
@@ -108,6 +118,16 @@ type ManagerMetrics struct {
 	OutboxPending             *prometheus.GaugeVec
 	OutboxOldestAge           *prometheus.GaugeVec
 	OutboxLocked              *prometheus.GaugeVec
+	RegistrarBatchSize        prometheus.Histogram
+	RegistrarZADD             *prometheus.CounterVec
+	SchedulerClaimed          prometheus.Counter
+	SchedulerPublished        *prometheus.CounterVec
+	SchedulerReclaimed        prometheus.Counter
+	SchedulerWakeLag          prometheus.Histogram
+	RepairRegistrations       *prometheus.CounterVec
+	ValkeyOperationErrors     *prometheus.CounterVec
+	BucketScheduleDepth       *prometheus.GaugeVec
+	BucketInflightDepth       *prometheus.GaugeVec
 }
 
 func NewManagerMetrics(registerer prometheus.Registerer) *ManagerMetrics {
@@ -118,11 +138,21 @@ func NewManagerMetrics(registerer prometheus.Registerer) *ManagerMetrics {
 		return prometheus.NewGauge(prometheus.GaugeOpts{Namespace: "defermq", Subsystem: "manager", Name: name, Help: help})
 	}
 	m := &ManagerMetrics{
+		IngestBatchSize:           prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: "defermq", Subsystem: "manager", Name: "ingest_batch_size", Help: "Fetched ingest consumer batch sizes.", Buckets: prometheus.ExponentialBuckets(1, 2, 11)}),
+		IngestCommits:             counter("ingest_commits_total", "Ingest database commit outcomes.", "result"),
+		IngestCommitDuration:      prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: "defermq", Subsystem: "manager", Name: "ingest_commit_duration_seconds", Help: "Ingest database commit duration.", Buckets: prometheus.DefBuckets}, []string{"result"}),
+		IngestRows:                counter("ingest_rows_total", "Ingest rows submitted to database commits.", "result"),
+		IngestRedeliveries:        prometheus.NewCounter(prometheus.CounterOpts{Namespace: "defermq", Subsystem: "manager", Name: "ingest_redeliveries_total", Help: "Ingest messages delivered more than once by JetStream."}),
+		IngestDLQ:                 counter("ingest_dlq_total", "Ingest messages sent to the dead-letter subject.", "result"),
 		PromoterCycles:            counter("promoter_cycles_total", "Promoter cycles.", "result"),
 		PromoterBatches:           counter("promoter_batches_total", "Promoter batches.", "full"),
 		PromoterBatchSize:         prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: "defermq", Subsystem: "manager", Name: "promoter_batch_size", Help: "Promoter candidate batch sizes.", Buckets: prometheus.ExponentialBuckets(1, 2, 12)}),
 		PromoterBatchDuration:     prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: "defermq", Subsystem: "manager", Name: "promoter_batch_duration_seconds", Help: "Promoter batch duration.", Buckets: prometheus.DefBuckets}),
 		PromotedMessages:          prometheus.NewCounter(prometheus.CounterOpts{Namespace: "defermq", Subsystem: "manager", Name: "promoted_messages_total", Help: "Promoted messages."}),
+		LoopErrors:                counter("loop_errors_total", "Manager loop operation errors.", "component"),
+		LoopDuration:              prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: "defermq", Subsystem: "manager", Name: "loop_duration_seconds", Help: "Manager loop cycle duration.", Buckets: prometheus.DefBuckets}, []string{"component"}),
+		LoopLastSuccess:           prometheus.NewGaugeVec(prometheus.GaugeOpts{Namespace: "defermq", Subsystem: "manager", Name: "loop_last_success_timestamp_seconds", Help: "Last successful manager loop cycle time."}, []string{"component"}),
+		LoopLastFullBatch:         prometheus.NewGaugeVec(prometheus.GaugeOpts{Namespace: "defermq", Subsystem: "manager", Name: "loop_last_full_batch_timestamp_seconds", Help: "Last manager loop cycle that observed a full batch."}, []string{"component"}),
 		OutboxClaimed:             counter("outbox_claimed_total", "Claimed outbox rows.", "kind"),
 		OutboxPublished:           counter("outbox_published_total", "Outbox publish outcomes.", "kind", "result"),
 		OutboxPublishDuration:     prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: "defermq", Subsystem: "manager", Name: "outbox_publish_duration_seconds", Help: "Outbox publish duration.", Buckets: prometheus.DefBuckets}, []string{"kind"}),
@@ -143,13 +173,76 @@ func NewManagerMetrics(registerer prometheus.Registerer) *ManagerMetrics {
 		OutboxPending:             prometheus.NewGaugeVec(prometheus.GaugeOpts{Namespace: "defermq", Subsystem: "manager", Name: "outbox_pending_total", Help: "Pending outbox rows."}, []string{"kind"}),
 		OutboxOldestAge:           prometheus.NewGaugeVec(prometheus.GaugeOpts{Namespace: "defermq", Subsystem: "manager", Name: "outbox_oldest_age_seconds", Help: "Age of the oldest pending outbox row."}, []string{"kind"}),
 		OutboxLocked:              prometheus.NewGaugeVec(prometheus.GaugeOpts{Namespace: "defermq", Subsystem: "manager", Name: "outbox_locked_total", Help: "Currently locked outbox rows."}, []string{"kind"}),
+		RegistrarBatchSize:        prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: "defermq", Subsystem: "manager", Name: "registrar_batch_size", Help: "Hot-register outbox batch sizes.", Buckets: prometheus.ExponentialBuckets(1, 2, 11)}),
+		RegistrarZADD:             counter("registrar_zadd_total", "Registrar schedule ZADD outcomes.", "result"),
+		SchedulerClaimed:          prometheus.NewCounter(prometheus.CounterOpts{Namespace: "defermq", Subsystem: "manager", Name: "scheduler_claimed_total", Help: "Schedule entries claimed into inflight."}),
+		SchedulerPublished:        counter("scheduler_published_total", "Scheduler ready publication outcomes.", "result"),
+		SchedulerReclaimed:        prometheus.NewCounter(prometheus.CounterOpts{Namespace: "defermq", Subsystem: "manager", Name: "scheduler_reclaimed_total", Help: "Expired inflight entries reclaimed to schedule."}),
+		SchedulerWakeLag:          prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: "defermq", Subsystem: "manager", Name: "scheduler_wake_lag_seconds", Help: "Delay from scheduled due time to scheduler claim; early claims are recorded as zero.", Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60}}),
+		RepairRegistrations:       counter("repair_registrations_total", "Repairer schedule registration outcomes.", "result"),
+		ValkeyOperationErrors:     counter("valkey_operation_errors_total", "Valkey operation errors in manager hot-index loops.", "operation"),
+		BucketScheduleDepth:       prometheus.NewGaugeVec(prometheus.GaugeOpts{Namespace: "defermq", Subsystem: "manager", Name: "bucket_schedule_depth", Help: "Last sampled schedule depth for a hot-index bucket."}, []string{"bucket"}),
+		BucketInflightDepth:       prometheus.NewGaugeVec(prometheus.GaugeOpts{Namespace: "defermq", Subsystem: "manager", Name: "bucket_inflight_depth", Help: "Last sampled inflight depth for a hot-index bucket."}, []string{"bucket"}),
 	}
-	registerer.MustRegister(m.PromoterCycles, m.PromoterBatches, m.PromoterBatchSize, m.PromoterBatchDuration, m.PromotedMessages,
-		m.OutboxClaimed, m.OutboxPublished, m.OutboxPublishDuration, m.OutboxPublishRetries, m.OverdueReconciled,
+	registerer.MustRegister(m.IngestBatchSize, m.IngestCommits, m.IngestCommitDuration, m.IngestRows, m.IngestRedeliveries,
+		m.IngestDLQ, m.PromoterCycles, m.PromoterBatches, m.PromoterBatchSize, m.PromoterBatchDuration, m.PromotedMessages,
+		m.LoopErrors, m.LoopDuration, m.LoopLastSuccess, m.LoopLastFullBatch, m.OutboxClaimed,
+		m.OutboxPublished, m.OutboxPublishDuration, m.OutboxPublishRetries, m.OverdueReconciled,
 		m.ProcessingLeasesReaped, m.RetentionDeleted, m.CollectorSuccess, m.CollectorLastSuccess, m.CollectorDuration,
 		m.CollectorErrors, m.UnpromotedHeadroom, m.UnpromotedExists, m.OldestUnpromotedDeliverAt, m.ScheduledDue,
-		m.Processing, m.ProcessingExpired, m.OutboxPending, m.OutboxOldestAge, m.OutboxLocked)
+		m.Processing, m.ProcessingExpired, m.OutboxPending, m.OutboxOldestAge, m.OutboxLocked,
+		m.RegistrarBatchSize, m.RegistrarZADD, m.SchedulerClaimed, m.SchedulerPublished,
+		m.SchedulerReclaimed, m.SchedulerWakeLag, m.RepairRegistrations, m.ValkeyOperationErrors,
+		m.BucketScheduleDepth, m.BucketInflightDepth)
 	return m
+}
+
+func (m *ManagerMetrics) ObserveIngestBatch(size int) {
+	m.IngestBatchSize.Observe(float64(size))
+}
+
+func (m *ManagerMetrics) ObserveIngestCommit(rows int, duration time.Duration, result string) {
+	m.IngestCommits.WithLabelValues(result).Inc()
+	m.IngestCommitDuration.WithLabelValues(result).Observe(duration.Seconds())
+	m.IngestRows.WithLabelValues(result).Add(float64(rows))
+}
+
+func (m *ManagerMetrics) ObserveIngestRedelivery() {
+	m.IngestRedeliveries.Inc()
+}
+
+func (m *ManagerMetrics) ObserveIngestDLQ(result string) {
+	m.IngestDLQ.WithLabelValues(result).Inc()
+}
+
+func (m *ManagerMetrics) RecordLoopError(component string) {
+	m.LoopErrors.WithLabelValues(component).Inc()
+}
+
+func (m *ManagerMetrics) ObserveLoop(
+	component string,
+	duration time.Duration,
+	succeeded bool,
+	fullBatch bool,
+) {
+	m.LoopDuration.WithLabelValues(component).Observe(duration.Seconds())
+	if component == "promoter" {
+		result := "error"
+		if succeeded {
+			result = "success"
+		}
+		m.PromoterCycles.WithLabelValues(result).Inc()
+	}
+	if succeeded {
+		m.LoopLastSuccess.WithLabelValues(component).Set(float64(time.Now().Unix()))
+	}
+	if fullBatch {
+		m.LoopLastFullBatch.WithLabelValues(component).Set(float64(time.Now().Unix()))
+	}
+}
+
+func (m *ManagerMetrics) ObserveOutboxPublish(kind string, duration time.Duration) {
+	m.OutboxPublishDuration.WithLabelValues(kind).Observe(duration.Seconds())
 }
 
 type PusherMetrics struct {

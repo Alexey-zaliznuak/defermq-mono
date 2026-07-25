@@ -67,8 +67,8 @@ func (s *Store) CollectManagerDBMetrics(ctx context.Context) (ManagerDBMetrics, 
 		result.UnpromotedHeadroom = time.Duration(*headroomSeconds * float64(time.Second))
 	}
 	result.Outbox = map[OutboxKind]OutboxMetrics{
-		OutboxSchedule: {},
-		OutboxReady:    {},
+		OutboxHotRegister: {},
+		OutboxReady:       {},
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT kind,

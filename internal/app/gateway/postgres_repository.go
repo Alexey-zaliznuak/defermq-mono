@@ -28,9 +28,13 @@ func NewPostgresRepository(store *postgres.Store, metrics *observability.Gateway
 
 func (r *PostgresRepository) Create(ctx context.Context, command CreateCommand) (domain.Delivery, bool, error) {
 	started := time.Now()
-	id, err := uuid.NewV7()
-	if err != nil {
-		return domain.Delivery{}, false, fmt.Errorf("generate delivery ID: %w", err)
+	id := command.DeliveryID
+	var err error
+	if id == uuid.Nil {
+		id, err = uuid.NewV7()
+		if err != nil {
+			return domain.Delivery{}, false, fmt.Errorf("generate delivery ID: %w", err)
+		}
 	}
 	command.Payload.ID, err = nonNilUUID(command.Payload.ID)
 	if err != nil {

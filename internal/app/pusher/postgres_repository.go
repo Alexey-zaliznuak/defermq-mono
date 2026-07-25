@@ -14,8 +14,13 @@ import (
 // here makes orchestration testable without making storage define an interface
 // for its callers.
 type postgresBackend interface {
-	ClaimDelivery(context.Context, postgres.ClaimDeliveryParams) (domain.Delivery, *postgres.ClaimRejection, error)
-	GetPayload(context.Context, uuid.UUID, int64) (domain.Payload, error)
+	ClaimDeliveriesBatch(
+		context.Context,
+		[]postgres.ClaimRequest,
+		string,
+		time.Duration,
+		time.Duration,
+	) ([]postgres.BatchClaimResult, error)
 	HeartbeatDelivery(context.Context, uuid.UUID, string, time.Duration) error
 	MarkDelivered(context.Context, uuid.UUID, string) error
 	ScheduleRetry(context.Context, postgres.RetryDeliveryParams) (domain.Delivery, error)
@@ -34,52 +39,31 @@ func NewPostgresRepository(backend postgresBackend) (*PostgresRepository, error)
 	return &PostgresRepository{backend: backend}, nil
 }
 
-func (r *PostgresRepository) Claim(
+func (r *PostgresRepository) ClaimBatch(
 	ctx context.Context,
-	id uuid.UUID,
-	revision int64,
+	requests []ClaimRequest,
 	owner string,
 	lease time.Duration,
 	tolerance time.Duration,
-) (ClaimResult, error) {
-	record, rejection, err := r.backend.ClaimDelivery(ctx, postgres.ClaimDeliveryParams{
-		DeliveryID:         id,
-		ScheduleRevision:   revision,
-		Owner:              owner,
-		Lease:              lease,
-		ClockSkewTolerance: tolerance,
-	})
+) ([]ClaimResult, error) {
+	storageRequests := make([]postgres.ClaimRequest, len(requests))
+	for index, request := range requests {
+		storageRequests[index] = postgres.ClaimRequest{
+			DeliveryID: request.DeliveryID, ScheduleRevision: request.ScheduleRevision,
+		}
+	}
+	records, err := r.backend.ClaimDeliveriesBatch(ctx, storageRequests, owner, lease, tolerance)
 	if err != nil {
-		return ClaimResult{}, err
+		return nil, err
 	}
-	if rejection == nil {
-		return ClaimResult{Reason: Claimed, Delivery: &record}, nil
+	results := make([]ClaimResult, len(records))
+	for index, record := range records {
+		results[index] = ClaimResult{
+			Reason: ClaimReason(record.Reason), Delivery: record.Delivery,
+			Payload: record.Payload, Wait: record.Wait,
+		}
 	}
-	if !rejection.Exists {
-		return ClaimResult{Reason: ClaimNotFound}, nil
-	}
-	if rejection.ScheduleRevision != revision {
-		return ClaimResult{Reason: ClaimStale}, nil
-	}
-	if rejection.Status.Terminal() {
-		return ClaimResult{Reason: ClaimTerminal}, nil
-	}
-	if rejection.Status == domain.StatusProcessing {
-		return ClaimResult{Reason: ClaimProcessing}, nil
-	}
-	wait := time.Until(rejection.DeliverAt)
-	if wait > tolerance {
-		return ClaimResult{Reason: ClaimTooEarly, Wait: wait}, nil
-	}
-	return ClaimResult{Reason: ClaimStale}, nil
-}
-
-func (r *PostgresRepository) LoadPayload(
-	ctx context.Context,
-	id uuid.UUID,
-	maxBytes int64,
-) (domain.Payload, error) {
-	return r.backend.GetPayload(ctx, id, maxBytes)
+	return results, nil
 }
 
 func (r *PostgresRepository) Heartbeat(

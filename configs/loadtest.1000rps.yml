@@ -1,0 +1,104 @@
+name: sustained-1000-rps
+seed: 2026072514
+
+gateway:
+  url: http://127.0.0.1:8080
+  timeout: 20s
+
+receiver:
+  listen_address: 127.0.0.1:18080
+  public_url: http://host.docker.internal:18080
+  path: /defermq
+
+load:
+  create_concurrency: 512
+  status_concurrency: 256
+  poll_interval: 2s
+  await_timeout: 10m
+  warmup: 5s
+  cooldown: 5s
+  early_tolerance: 100ms
+
+resources:
+  enabled: true
+  sample_interval: 1s
+  command_timeout: 10s
+  compose_project: defermq
+  go_services: [gateway, postgres-manager, pusher]
+  non_go_services: [postgres, nats, valkey]
+
+assertions:
+  max_create_errors: 0
+  max_action_errors: 0
+  max_missing: 0
+  max_duplicates: 0
+  max_early_deliveries: 0
+  min_delivery_success_rate: 1
+  max_delivery_lag: 10s
+
+report:
+  directory: test-results/load/1000rps
+  json_file: report.json
+  markdown_file: report.md
+  include_resource_samples: false
+
+message_groups:
+  - name: fast-small
+    count: 48000
+    admission_offset: {kind: uniform, min: 0s, max: 2m}
+    delivery_delay: {mean: 3s, stddev: 1s, min: 1s, max: 8s}
+    payload_bytes: 128
+    max_attempts: 5
+    fail_first_attempts: 0
+    failure_status: 503
+    cancel_fraction: 0
+    reschedule_fraction: 0
+    reschedule_delay: {mean: 0s, min: 0s, max: 0s}
+
+  - name: standard-medium
+    count: 36000
+    admission_offset: {kind: uniform, min: 0s, max: 2m}
+    delivery_delay: {mean: 15s, stddev: 5s, min: 3s, max: 30s}
+    payload_bytes: 2048
+    max_attempts: 5
+    fail_first_attempts: 0
+    failure_status: 503
+    cancel_fraction: 0
+    reschedule_fraction: 0
+    reschedule_delay: {mean: 0s, min: 0s, max: 0s}
+
+  - name: retry-traffic
+    count: 18000
+    admission_offset: {kind: uniform, min: 0s, max: 2m}
+    delivery_delay: {mean: 7s, stddev: 2s, min: 2s, max: 15s}
+    payload_bytes: 512
+    max_attempts: 5
+    fail_first_attempts: 1
+    failure_status: 503
+    cancel_fraction: 0
+    reschedule_fraction: 0
+    reschedule_delay: {mean: 0s, min: 0s, max: 0s}
+
+  - name: lifecycle
+    count: 12000
+    admission_offset: {kind: uniform, min: 0s, max: 2m}
+    delivery_delay: {mean: 30s, stddev: 8s, min: 10s, max: 50s}
+    payload_bytes: 1024
+    max_attempts: 6
+    fail_first_attempts: 0
+    failure_status: 503
+    cancel_fraction: 0.05
+    reschedule_fraction: 0.10
+    reschedule_delay: {mean: -10s, stddev: 3s, min: -20s, max: -3s}
+
+  - name: large-payload
+    count: 6000
+    admission_offset: {kind: uniform, min: 0s, max: 2m}
+    delivery_delay: {mean: 45s, stddev: 10s, min: 15s, max: 1m10s}
+    payload_bytes: 32768
+    max_attempts: 5
+    fail_first_attempts: 0
+    failure_status: 503
+    cancel_fraction: 0
+    reschedule_fraction: 0
+    reschedule_delay: {mean: 0s, min: 0s, max: 0s}

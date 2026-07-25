@@ -22,6 +22,7 @@ type RuntimeConfig struct {
 	ShutdownTimeout    time.Duration
 	SourceDSN          string
 	SourceMaxConns     int32
+	SynchronousCommit  string
 	QueryTimeout       time.Duration
 	NATSURL            string
 	NATSUser           string
@@ -42,6 +43,8 @@ type RuntimeConfig struct {
 	MaxDeliver         int
 	FetchBatch         int
 	FetchMaxWait       time.Duration
+	ClaimBatch         int
+	ClaimFlushInterval time.Duration
 	Lease              time.Duration
 	Heartbeat          time.Duration
 	ClockTolerance     time.Duration
@@ -71,6 +74,12 @@ func LoadConfig() (RuntimeConfig, error) {
 	}
 	if config.SourceMaxConns, err = envInt32("DEFERMQ_POSTGRES_MAX_CONNS", 30); err != nil {
 		return config, err
+	}
+	config.SynchronousCommit = envString("DEFERMQ_PUSHER_POSTGRES_SYNCHRONOUS_COMMIT", "off")
+	switch config.SynchronousCommit {
+	case "on", "off", "local", "remote_write", "remote_apply":
+	default:
+		return config, fmt.Errorf("invalid DEFERMQ_PUSHER_POSTGRES_SYNCHRONOUS_COMMIT %q", config.SynchronousCommit)
 	}
 	if config.QueryTimeout, err = envDuration("DEFERMQ_POSTGRES_QUERY_TIMEOUT", 5*time.Second); err != nil {
 		return config, err
@@ -108,6 +117,12 @@ func LoadConfig() (RuntimeConfig, error) {
 		return config, err
 	}
 	if config.FetchMaxWait, err = envDuration("DEFERMQ_PUSHER_FETCH_MAX_WAIT", 2*time.Second); err != nil {
+		return config, err
+	}
+	if config.ClaimBatch, err = envInt("DEFERMQ_PUSHER_CLAIM_BATCH_SIZE", 100); err != nil {
+		return config, err
+	}
+	if config.ClaimFlushInterval, err = envDuration("DEFERMQ_PUSHER_CLAIM_FLUSH_INTERVAL", 10*time.Millisecond); err != nil {
 		return config, err
 	}
 	if config.Lease, err = envDuration("DEFERMQ_PUSHER_PROCESSING_LEASE", time.Minute); err != nil {
@@ -166,6 +181,9 @@ func LoadConfig() (RuntimeConfig, error) {
 	}
 	if config.Heartbeat >= config.Lease {
 		return config, fmt.Errorf("heartbeat interval must be shorter than processing lease")
+	}
+	if config.ClaimBatch <= 0 {
+		return config, fmt.Errorf("DEFERMQ_PUSHER_CLAIM_BATCH_SIZE must be positive")
 	}
 	return config, nil
 }

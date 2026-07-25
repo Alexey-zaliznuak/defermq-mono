@@ -9,6 +9,7 @@ import (
 
 	"github.com/defermq/defermq/internal/domain"
 	"github.com/defermq/defermq/internal/hotstorage/natsjs"
+	"github.com/defermq/defermq/internal/hotstorage/valkey"
 	"github.com/google/uuid"
 )
 
@@ -34,9 +35,58 @@ type PromoterRepository interface {
 }
 
 type OutboxRepository interface {
-	ClaimOutbox(context.Context, string, int, time.Duration) ([]OutboxRecord, error)
+	ClaimOutbox(context.Context, string, natsjs.OutboxKind, int, time.Duration) ([]OutboxRecord, error)
 	MarkOutboxPublished(context.Context, OutboxRecord) error
 	MarkOutboxFailed(context.Context, OutboxRecord, time.Duration, string) error
+}
+
+// OutboxBatchRepository is an optional optimized completion path. Keeping it
+// separate from OutboxRepository preserves simple repositories and test fakes.
+type OutboxBatchRepository interface {
+	MarkOutboxPublishedBatch(context.Context, []OutboxRecord) error
+}
+
+type HotIndex interface {
+	RepairRegister(context.Context, valkey.Entry) (bool, error)
+	AcquireLease(context.Context, int, time.Duration) (string, bool, error)
+	RenewLease(context.Context, int, string, time.Duration) error
+	ReleaseLease(context.Context, int, string) error
+	ClaimDue(context.Context, int, string, time.Duration, time.Duration, int) ([]valkey.ClaimedEntry, error)
+	ReclaimExpired(context.Context, int, string, int) ([]valkey.Entry, error)
+	Complete(context.Context, uuid.UUID, int64, string) (bool, error)
+	Heartbeat(context.Context, int, string, string, string) (time.Time, error)
+	BucketCount() int
+}
+
+// HotIndexBatchRegistrar is an optional optimized registration path.
+// Results are aligned with entries and may report failures per bucket.
+type HotIndexBatchRegistrar interface {
+	RepairRegisterBatch(context.Context, []valkey.Entry) ([]valkey.RepairRegisterResult, error)
+}
+
+type ReadyRecord struct {
+	DeliveryID       uuid.UUID
+	ScheduleRevision int64
+	DeliverAt        time.Time
+	DestinationType  domain.DestinationType
+}
+
+type ReadyRepository interface {
+	ResolveReady(context.Context, []valkey.ClaimedEntry) ([]ReadyRecord, error)
+	MarkReadyPublished(context.Context, []ReadyRecord) error
+}
+
+type ReadyBatchPublisher interface {
+	PublishReadyBatch(context.Context, []natsjs.PublishRequest) ([]natsjs.PublishRequest, error)
+}
+
+type RepairCursor struct {
+	DeliverAt  time.Time
+	DeliveryID uuid.UUID
+}
+
+type RepairRepository interface {
+	RepairPage(context.Context, time.Duration, RepairCursor, int) ([]valkey.Entry, error)
 }
 
 type OverdueRepository interface {
@@ -58,9 +108,35 @@ type Publisher interface {
 
 type ErrorHandler func(component string, err error)
 
+type LoopObserver func(component string, duration time.Duration, succeeded, fullBatch bool)
+
+type PublishObserver func(kind natsjs.OutboxKind, duration time.Duration)
+
+type BatchSizeObserver func(size int)
+
+type ResultObserver func(result string)
+
+type CountObserver func(count int)
+
+type WakeLagObserver func(lag time.Duration)
+
+type OperationErrorObserver func(operation string)
+
 func report(handler ErrorHandler, component string, err error) {
 	if handler != nil {
 		handler(component, err)
+	}
+}
+
+func observeLoop(
+	observer LoopObserver,
+	component string,
+	started time.Time,
+	succeeded bool,
+	fullBatch bool,
+) {
+	if observer != nil {
+		observer(component, time.Since(started), succeeded, fullBatch)
 	}
 }
 

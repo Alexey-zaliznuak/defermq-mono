@@ -24,6 +24,8 @@ type PoolConfig struct {
 	QueueSize          int
 	FetchBatchSize     int
 	FetchMaxWait       time.Duration
+	ClaimBatchSize     int
+	ClaimFlushInterval time.Duration
 	ProcessingLease    time.Duration
 	HeartbeatInterval  time.Duration
 	ClockSkewTolerance time.Duration
@@ -55,7 +57,8 @@ func NewPool(
 	logger *zap.Logger,
 ) (*Pool, error) {
 	if config.Workers <= 0 || config.QueueSize < config.Workers || config.FetchBatchSize <= 0 ||
-		config.FetchMaxWait <= 0 || config.ProcessingLease <= 0 ||
+		config.FetchMaxWait <= 0 || config.ClaimBatchSize <= 0 || config.ClaimFlushInterval <= 0 ||
+		config.ProcessingLease <= 0 ||
 		config.HeartbeatInterval <= 0 || config.HeartbeatInterval >= config.ProcessingLease ||
 		config.ClockSkewTolerance < 0 || config.MaxPayloadBytes <= 0 ||
 		config.HotHorizon < 0 || config.TransitionRetry <= 0 || config.ShutdownTimeout <= 0 || owner == "" ||
@@ -85,15 +88,15 @@ func (p *Pool) SetMetrics(metrics *observability.PusherMetrics) {
 }
 
 func (p *Pool) Run(ctx context.Context) error {
-	queue := make(chan Message, p.config.QueueSize)
+	queue := make(chan claimedJob, p.config.QueueSize)
 	workCtx, cancelWork := context.WithCancel(context.Background())
 	var workers sync.WaitGroup
 	for worker := 0; worker < p.config.Workers; worker++ {
 		workers.Add(1)
 		go func(workerID int) {
 			defer workers.Done()
-			for message := range queue {
-				p.handle(workCtx, workerID, message)
+			for job := range queue {
+				p.handleClaimed(workCtx, workerID, job)
 			}
 		}(worker)
 	}
@@ -110,8 +113,7 @@ fetchLoop:
 			}
 			continue
 		}
-		batch := min(p.config.FetchBatchSize, capacity)
-		messages, err := p.consumer.Fetch(ctx, batch, p.config.FetchMaxWait)
+		message, err := p.consumer.Next(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				break fetchLoop
@@ -122,10 +124,53 @@ fetchLoop:
 			}
 			continue
 		}
-		for _, message := range messages {
+		if message == nil {
+			p.logger.Warn("ready consumer returned an empty message")
+			if !waitContext(ctx, 100*time.Millisecond) {
+				break fetchLoop
+			}
+			continue
+		}
+		limit := min(p.config.FetchBatchSize, p.config.ClaimBatchSize, capacity)
+		messages := []Message{message}
+		flushDeadline := time.Now().Add(p.config.ClaimFlushInterval)
+		for len(messages) < limit {
+			remaining := time.Until(flushDeadline)
+			if remaining <= 0 {
+				break
+			}
+			fetchCtx, cancelFetch := context.WithTimeout(ctx, remaining)
+			next, nextErr := p.consumer.Next(fetchCtx)
+			fetchTimedOut := errors.Is(fetchCtx.Err(), context.DeadlineExceeded)
+			cancelFetch()
+			if nextErr != nil {
+				if ctx.Err() != nil {
+					for _, unhandled := range messages {
+						_ = unhandled.Nak(workCtx, p.config.TransitionRetry)
+					}
+					break fetchLoop
+				}
+				if errors.Is(nextErr, context.DeadlineExceeded) || fetchTimedOut {
+					break
+				}
+				p.logger.Warn("ready microbatch fetch failed",
+					zap.String("destination_type", string(p.consumer.Type())), zap.Error(nextErr))
+				break
+			}
+			if next == nil {
+				break
+			}
+			messages = append(messages, next)
+		}
+		jobs := p.claimMessages(ctx, workCtx, messages)
+		for index, job := range jobs {
 			select {
-			case queue <- message:
+			case queue <- job:
 			case <-ctx.Done():
+				_ = job.message.Nak(workCtx, p.config.TransitionRetry)
+				for _, unhandled := range jobs[index+1:] {
+					_ = unhandled.message.Nak(workCtx, p.config.TransitionRetry)
+				}
 				break fetchLoop
 			}
 		}
@@ -148,70 +193,102 @@ fetchLoop:
 	return nil
 }
 
-func (p *Pool) handle(parent context.Context, workerID int, message Message) {
+type pendingClaim struct {
+	message Message
+	event   natsjs.ReadyEvent
+}
+
+type claimedJob struct {
+	message Message
+	event   natsjs.ReadyEvent
+	claim   ClaimResult
+}
+
+func (p *Pool) claimMessages(claimCtx, dispositionCtx context.Context, messages []Message) []claimedJob {
 	destinationType := string(p.consumer.Type())
-	if p.metrics != nil {
-		p.metrics.MessagesReceived.WithLabelValues(destinationType).Inc()
-	}
-	event, err := decodeEvent(message.Data(), p.consumer.Type())
-	if err != nil {
+	pending := make([]pendingClaim, 0, len(messages))
+	requests := make([]ClaimRequest, 0, len(messages))
+	for _, message := range messages {
 		if p.metrics != nil {
-			p.metrics.EventsInvalid.WithLabelValues("validation").Inc()
-			p.metrics.Acks.WithLabelValues(destinationType, "term").Inc()
+			p.metrics.MessagesReceived.WithLabelValues(destinationType).Inc()
 		}
-		p.logger.Warn("discarding invalid ready event", zap.Error(err))
-		_ = message.Term(parent)
-		return
+		event, err := decodeEvent(message.Data(), p.consumer.Type())
+		if err != nil {
+			if p.metrics != nil {
+				p.metrics.EventsInvalid.WithLabelValues("validation").Inc()
+				p.metrics.Acks.WithLabelValues(destinationType, "term").Inc()
+			}
+			p.logger.Warn("discarding invalid ready event", zap.Error(err))
+			_ = message.Term(dispositionCtx)
+			continue
+		}
+		now := p.now().UTC()
+		if wait := event.DeliverAt.Sub(now); wait > p.config.ClockSkewTolerance {
+			if p.metrics != nil {
+				p.metrics.EarlyEvents.WithLabelValues(destinationType).Inc()
+			}
+			_ = message.Nak(dispositionCtx, wait)
+			continue
+		}
+		pending = append(pending, pendingClaim{message: message, event: event})
+		requests = append(requests, ClaimRequest{
+			DeliveryID: event.DeliveryID, ScheduleRevision: event.ScheduleRevision,
+		})
 	}
+	if len(requests) == 0 {
+		return nil
+	}
+	claims, err := p.repository.ClaimBatch(
+		claimCtx, requests, p.owner, p.config.ProcessingLease, p.config.ClockSkewTolerance,
+	)
+	if err != nil || len(claims) != len(pending) {
+		if p.metrics != nil {
+			p.metrics.Claims.WithLabelValues(destinationType, "error").Add(float64(len(pending)))
+		}
+		p.logger.Warn("delivery batch claim failed",
+			zap.Int("batch_size", len(pending)), zap.Int("result_size", len(claims)), zap.Error(err))
+		for _, item := range pending {
+			_ = item.message.Nak(dispositionCtx, p.config.TransitionRetry)
+		}
+		return nil
+	}
+	jobs := make([]claimedJob, 0, len(claims))
+	for index, claim := range claims {
+		if p.metrics != nil {
+			p.metrics.Claims.WithLabelValues(destinationType, string(claim.Reason)).Inc()
+		}
+		switch claim.Reason {
+		case Claimed:
+			jobs = append(jobs, claimedJob{
+				message: pending[index].message, event: pending[index].event, claim: claim,
+			})
+		case ClaimTooEarly:
+			wait := claim.Wait
+			if wait <= 0 {
+				wait = p.config.TransitionRetry
+			}
+			_ = pending[index].message.Nak(dispositionCtx, wait)
+		case ClaimNotFound, ClaimStale, ClaimTerminal, ClaimProcessing:
+			_ = pending[index].message.Ack(dispositionCtx)
+		default:
+			p.logger.Error("unknown batch claim outcome", zap.String("reason", string(claim.Reason)))
+			_ = pending[index].message.Nak(dispositionCtx, p.config.TransitionRetry)
+		}
+	}
+	return jobs
+}
+
+func (p *Pool) handleClaimed(parent context.Context, workerID int, job claimedJob) {
+	message, event, claim := job.message, job.event, job.claim
+	destinationType := string(p.consumer.Type())
 	fields := []zap.Field{
 		zap.String("delivery_id", event.DeliveryID.String()),
 		zap.Int64("schedule_revision", event.ScheduleRevision),
 		zap.String("destination_type", string(event.DestinationType)),
 		zap.Int("worker_id", workerID),
 	}
-
 	now := p.now().UTC()
-	if wait := event.DeliverAt.Sub(now); wait > p.config.ClockSkewTolerance {
-		if p.metrics != nil {
-			p.metrics.EarlyEvents.WithLabelValues(destinationType).Inc()
-		}
-		p.logger.Debug("ready event arrived early", append(fields, zap.Duration("wait", wait))...)
-		_ = message.Nak(parent, wait)
-		return
-	}
-	claim, err := p.repository.Claim(
-		parent,
-		event.DeliveryID,
-		event.ScheduleRevision,
-		p.owner,
-		p.config.ProcessingLease,
-		p.config.ClockSkewTolerance,
-	)
-	if err != nil {
-		if p.metrics != nil {
-			p.metrics.Claims.WithLabelValues(destinationType, "error").Inc()
-		}
-		p.logger.Warn("delivery claim failed", append(fields, zap.Error(err))...)
-		_ = message.Nak(parent, p.config.TransitionRetry)
-		return
-	}
-	if claim.Reason != Claimed {
-		if p.metrics != nil {
-			p.metrics.Claims.WithLabelValues(destinationType, string(claim.Reason)).Inc()
-		}
-		if claim.Reason == ClaimTooEarly {
-			wait := claim.Wait
-			if wait <= 0 {
-				wait = p.config.TransitionRetry
-			}
-			_ = message.Nak(parent, wait)
-			return
-		}
-		_ = message.Ack(parent)
-		return
-	}
 	if p.metrics != nil {
-		p.metrics.Claims.WithLabelValues(destinationType, "claimed").Inc()
 		p.metrics.Inflight.WithLabelValues(destinationType).Inc()
 		defer p.metrics.Inflight.WithLabelValues(destinationType).Dec()
 		p.metrics.DeliveryStartLag.WithLabelValues(destinationType).Observe(max(0, now.Sub(event.DeliverAt).Seconds()))
@@ -223,12 +300,18 @@ func (p *Pool) handle(parent context.Context, workerID int, message Message) {
 		return
 	}
 
-	payload, err := p.repository.LoadPayload(parent, deliveryRecord.PayloadID, p.config.MaxPayloadBytes)
-	if err != nil {
+	payload := claim.Payload
+	if payload == nil {
+		p.logger.Error("claim returned no payload", fields...)
+		_ = message.Nak(parent, p.config.TransitionRetry)
+		return
+	}
+	if payload.SizeBytes > p.config.MaxPayloadBytes {
 		p.finishFailure(parent, message, deliveryRecord, delivery.NewPushError(
 			"payload_load_failed",
-			!errors.Is(err, domain.ErrNotFound) && !errors.Is(err, domain.ErrPayloadTooLarge),
-			err,
+			false,
+			fmt.Errorf("%w: payload is %d bytes, limit is %d",
+				domain.ErrPayloadTooLarge, payload.SizeBytes, p.config.MaxPayloadBytes),
 		), fields)
 		return
 	}

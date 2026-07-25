@@ -1,0 +1,123 @@
+name: mixed-high-load
+seed: 20260725
+
+gateway:
+  url: http://127.0.0.1:8080
+  timeout: 15s
+
+receiver:
+  listen_address: 127.0.0.1:18080
+  # Адрес должен быть доступен Pusher. Для Docker Desktop используется
+  # host.docker.internal, хотя receiver слушает порт на host.
+  public_url: http://host.docker.internal:18080
+  path: /defermq
+
+load:
+  create_concurrency: 64
+  status_concurrency: 32
+  poll_interval: 250ms
+  await_timeout: 15m
+  warmup: 5s
+  cooldown: 5s
+  early_tolerance: 100ms
+
+resources:
+  enabled: true
+  sample_interval: 1s
+  command_timeout: 10s
+  compose_project: defermq
+  go_services: [gateway, postgres-manager, pusher]
+  non_go_services: [postgres, nats, valkey, kafka, rabbitmq, target-postgres]
+
+assertions:
+  max_create_errors: 0
+  max_action_errors: 0
+  max_missing: 0
+  max_duplicates: 0
+  max_early_deliveries: 0
+  min_delivery_success_rate: 1
+  # 0s отключает ограничение, но лаг всё равно попадает в отчёт.
+  max_delivery_lag: 0s
+
+report:
+  directory: test-results/load
+  json_file: report.json
+  markdown_file: report.md
+  include_resource_samples: false
+
+message_groups:
+  # Ровный близкий поток: admission и delivery распределены около средних
+  # значений по нормальному распределению и ограничены min/max.
+  - name: near-term
+    count: 1000
+    admission_offset:
+      mean: 10s
+      stddev: 3s
+      min: 0s
+      max: 20s
+    delivery_delay:
+      mean: 30s
+      stddev: 8s
+      min: 5s
+      max: 1m
+    payload_bytes: 1024
+    max_attempts: 10
+    fail_first_attempts: 0
+    failure_status: 503
+    cancel_fraction: 0.02
+    reschedule_fraction: 0.05
+    reschedule_delay:
+      mean: 20s
+      stddev: 5s
+      min: 5s
+      max: 40s
+
+  # Короткий burst с принудительным первым 503 для проверки retry.
+  - name: retry-burst
+    count: 300
+    admission_offset:
+      mean: 20s
+      stddev: 500ms
+      min: 18s
+      max: 22s
+    delivery_delay:
+      mean: 15s
+      stddev: 2s
+      min: 8s
+      max: 25s
+    payload_bytes: 4096
+    max_attempts: 6
+    fail_first_attempts: 1
+    failure_status: 503
+    cancel_fraction: 0
+    reschedule_fraction: 0
+    reschedule_delay:
+      mean: 0s
+      stddev: 0s
+      min: 0s
+      max: 0s
+
+  # Более дальние сообщения проверяют cold PostgreSQL schedule и promotion.
+  - name: cold-schedule
+    count: 200
+    admission_offset:
+      mean: 5s
+      stddev: 2s
+      min: 0s
+      max: 10s
+    delivery_delay:
+      mean: 3m
+      stddev: 20s
+      min: 2m15s
+      max: 4m
+    payload_bytes: 256
+    max_attempts: 10
+    fail_first_attempts: 0
+    failure_status: 503
+    cancel_fraction: 0
+    reschedule_fraction: 0.05
+    reschedule_delay:
+      mean: -90s
+      stddev: 10s
+      min: -2m
+      max: -1m

@@ -16,6 +16,7 @@ type ProcessingReaper struct {
 	Repository ProcessingReaperRepository
 	Config     ProcessingReaperConfig
 	OnError    ErrorHandler
+	Observe    LoopObserver
 }
 
 func (r *ProcessingReaper) Run(ctx context.Context) error {
@@ -23,12 +24,16 @@ func (r *ProcessingReaper) Run(ctx context.Context) error {
 		return errors.New("invalid processing reaper configuration")
 	}
 	for {
+		started := time.Now()
 		count, err := r.Repository.ReapExpiredProcessing(ctx, r.Config.RecoveryDelay, r.Config.BatchSize)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
 			report(r.OnError, "processing_reaper", err)
+			observeLoop(r.Observe, "processing_reaper", started, false, false)
+		} else {
+			observeLoop(r.Observe, "processing_reaper", started, true, count == r.Config.BatchSize)
 		}
 		if err == nil && count == r.Config.BatchSize {
 			continue

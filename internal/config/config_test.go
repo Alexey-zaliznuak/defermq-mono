@@ -19,11 +19,14 @@ func TestLoadDefaultsForEveryService(t *testing.T) {
 			if cfg.Common.ServiceName != "defermq-"+string(service) {
 				t.Fatalf("unexpected service name %q", cfg.Common.ServiceName)
 			}
-			if cfg.Common.HotHorizon != 2*time.Minute || cfg.Common.MaxPayloadBytes != 1<<20 {
+			if cfg.Common.HotHorizon != 10*time.Second || cfg.Common.MaxPayloadBytes != 1<<20 {
 				t.Fatalf("common defaults were not applied: %+v", cfg.Common)
 			}
 			if cfg.Manager.PromoterBatchSize != 1000 || cfg.Pusher.WorkersHTTP != 32 {
 				t.Fatal("service defaults were not fully populated")
+			}
+			if cfg.Pusher.ClaimBatchSize != 100 || cfg.Pusher.ClaimFlushInterval != 10*time.Millisecond {
+				t.Fatal("Pusher batch claim defaults were not applied")
 			}
 		})
 	}

@@ -22,6 +22,7 @@ type PoolConfig struct {
 	HealthCheckPeriod time.Duration
 	ConnectTimeout    time.Duration
 	QueryTimeout      time.Duration
+	RuntimeParams     map[string]string
 }
 
 func (c PoolConfig) Validate() error {
@@ -60,6 +61,9 @@ func Open(ctx context.Context, cfg PoolConfig) (*Store, error) {
 	}
 	if cfg.ApplicationName != "" {
 		poolCfg.ConnConfig.RuntimeParams["application_name"] = cfg.ApplicationName
+	}
+	for name, value := range cfg.RuntimeParams {
+		poolCfg.ConnConfig.RuntimeParams[name] = value
 	}
 	if cfg.MaxConns > 0 {
 		poolCfg.MaxConns = cfg.MaxConns

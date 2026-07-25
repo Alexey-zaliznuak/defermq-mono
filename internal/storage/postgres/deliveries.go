@@ -102,14 +102,14 @@ func outboxKindFor(deliverAt, now time.Time, hotHorizon time.Duration) (OutboxKi
 		return OutboxReady, true
 	}
 	if !deliverAt.After(now.Add(hotHorizon)) {
-		return OutboxSchedule, true
+		return OutboxHotRegister, true
 	}
 	return "", false
 }
 
 func insertOutbox(ctx context.Context, tx pgx.Tx, d domain.Delivery, kind OutboxKind) error {
 	var deliverAt any
-	if kind == OutboxSchedule {
+	if kind == OutboxHotRegister {
 		deliverAt = d.DeliverAt
 	}
 	_, err := tx.Exec(ctx, `

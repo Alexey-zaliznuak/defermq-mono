@@ -78,7 +78,7 @@ func TestIntegrationGatewayAndPusherLifecycle(t *testing.T) {
 	store := integrationStore(t)
 	ctx := context.Background()
 	key := "integration-idempotency"
-	params := newCreateParams(time.Now().Add(-time.Second), &key)
+	params := newCreateParams(time.Now().Add(-5*time.Second), &key)
 	created, replay, err := store.CreateDelivery(ctx, params)
 	if err != nil || replay {
 		t.Fatalf("CreateDelivery() = replay %v, error %v", replay, err)
@@ -152,6 +152,78 @@ func TestIntegrationGatewayAndPusherLifecycle(t *testing.T) {
 	}
 }
 
+func TestIntegrationClaimDeliveriesBatchOutcomesAndOrder(t *testing.T) {
+	store := integrationStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	claimable, _, err := store.CreateDelivery(ctx, newCreateParams(now.Add(-time.Second), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	early, _, err := store.CreateDelivery(ctx, newCreateParams(now.Add(time.Minute), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale, _, err := store.CreateDelivery(ctx, newCreateParams(now.Add(-time.Second), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale, err = store.RescheduleDelivery(ctx, RescheduleParams{
+		DeliveryID: stale.ID, DeliverAt: now.Add(time.Minute), HotHorizon: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, _, err := store.CreateDelivery(ctx, newCreateParams(now.Add(-time.Second), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err = store.CancelDelivery(ctx, terminal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := store.ClaimDeliveriesBatch(ctx, []ClaimRequest{
+		{DeliveryID: early.ID, ScheduleRevision: early.ScheduleRevision},
+		{DeliveryID: claimable.ID, ScheduleRevision: claimable.ScheduleRevision},
+		{DeliveryID: stale.ID, ScheduleRevision: stale.ScheduleRevision - 1},
+		{DeliveryID: terminal.ID, ScheduleRevision: terminal.ScheduleRevision},
+	}, "batch-pusher", time.Minute, 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("ClaimDeliveriesBatch(): %v", err)
+	}
+	wantReasons := []string{"too_early", "claimed", "stale_revision", "terminal"}
+	for index, want := range wantReasons {
+		if results[index].Reason != want {
+			t.Errorf("result[%d].Reason = %q, want %q", index, results[index].Reason, want)
+		}
+	}
+	if results[0].Wait <= 0 {
+		t.Errorf("early wait = %s", results[0].Wait)
+	}
+	if results[1].Delivery == nil || results[1].Delivery.ID != claimable.ID ||
+		results[1].Delivery.Attempts != 1 || results[1].Payload == nil ||
+		string(results[1].Payload.Body) != `{"ok":true}` {
+		t.Fatalf("claimed result did not include delivery and payload: %#v", results[1])
+	}
+
+	duplicate, _, err := store.CreateDelivery(ctx, newCreateParams(now.Add(-time.Second), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicates, err := store.ClaimDeliveriesBatch(ctx, []ClaimRequest{
+		{DeliveryID: duplicate.ID, ScheduleRevision: duplicate.ScheduleRevision},
+		{DeliveryID: duplicate.ID, ScheduleRevision: duplicate.ScheduleRevision},
+	}, "batch-pusher", time.Minute, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicates[0].Reason != "claimed" || duplicates[1].Reason != "processing" {
+		t.Fatalf("duplicate outcomes = %q, %q", duplicates[0].Reason, duplicates[1].Reason)
+	}
+}
+
 func TestIntegrationManagerMaintenance(t *testing.T) {
 	store := integrationStore(t)
 	ctx := context.Background()
@@ -189,5 +261,90 @@ func TestIntegrationManagerMaintenance(t *testing.T) {
 	metrics, err := store.CollectManagerDBMetrics(ctx)
 	if err != nil || metrics.ScheduledDue < 1 || metrics.Outbox[OutboxReady].Pending < 1 {
 		t.Fatalf("CollectManagerDBMetrics() = %#v, %v", metrics, err)
+	}
+}
+
+func TestIntegrationRecoveryQueriesFenceCompletedAndStaleRevisions(t *testing.T) {
+	store := integrationStore(t)
+	ctx := context.Background()
+
+	overdue, _, err := store.CreateDelivery(ctx, newCreateParams(time.Now().Add(-time.Minute), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx,
+		`DELETE FROM nats_outbox WHERE delivery_id = $1`, overdue.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `
+		UPDATE deliveries
+		SET ready_published_revision = schedule_revision,
+			ready_published_at = clock_timestamp()
+		WHERE id = $1`, overdue.ID); err != nil {
+		t.Fatal(err)
+	}
+	if reconciled, err := store.ReconcileOverdue(ctx, 0, 10); err != nil || reconciled != 0 {
+		t.Fatalf("ready-published revision reconciled again: count=%d err=%v", reconciled, err)
+	}
+
+	pastPromotion, _, err := store.CreateDelivery(
+		ctx, newCreateParams(time.Now().Add(10*time.Minute), nil),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `
+		UPDATE deliveries SET deliver_at = clock_timestamp() - interval '1 second'
+		WHERE id = $1`, pastPromotion.ID); err != nil {
+		t.Fatal(err)
+	}
+	promotion, err := store.PromoteBatch(ctx, time.Now().Add(time.Hour), 10)
+	if err != nil || promotion.Candidates != 0 || promotion.Inserted != 0 {
+		t.Fatalf("promoter re-registered overdue revision: result=%+v err=%v", promotion, err)
+	}
+
+	rescheduled, _, err := store.CreateDelivery(
+		ctx, newCreateParams(time.Now().Add(10*time.Minute), nil),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rescheduled, err = store.RescheduleDelivery(ctx, RescheduleParams{
+		DeliveryID: rescheduled.ID,
+		DeliverAt:  time.Now().Add(-5 * time.Second),
+		HotHorizon: time.Minute,
+	})
+	if err != nil || rescheduled.ScheduleRevision != 2 {
+		t.Fatalf("RescheduleDelivery() = %+v, %v", rescheduled, err)
+	}
+	if _, rejection, err := store.ClaimDelivery(ctx, ClaimDeliveryParams{
+		DeliveryID: rescheduled.ID, ScheduleRevision: 1, Owner: "stale-reschedule",
+		Lease: time.Minute,
+	}); err != nil || rejection == nil || rejection.ScheduleRevision != 2 {
+		t.Fatalf("old rescheduled revision was not fenced: rejection=%+v err=%v", rejection, err)
+	}
+	if _, rejection, err := store.ClaimDelivery(ctx, ClaimDeliveryParams{
+		DeliveryID: rescheduled.ID, ScheduleRevision: 2, Owner: "current-reschedule",
+		Lease: time.Minute, ClockSkewTolerance: 5 * time.Second,
+	}); err != nil || rejection != nil {
+		t.Fatalf("current rescheduled revision was rejected: rejection=%+v err=%v", rejection, err)
+	}
+
+	cancelled, _, err := store.CreateDelivery(
+		ctx, newCreateParams(time.Now().Add(-time.Second), nil),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, err = store.CancelDelivery(ctx, cancelled.ID)
+	if err != nil || cancelled.ScheduleRevision != 2 || cancelled.Status != domain.StatusCancelled {
+		t.Fatalf("CancelDelivery() = %+v, %v", cancelled, err)
+	}
+	if _, rejection, err := store.ClaimDelivery(ctx, ClaimDeliveryParams{
+		DeliveryID: cancelled.ID, ScheduleRevision: 1, Owner: "stale-cancel",
+		Lease: time.Minute,
+	}); err != nil || rejection == nil || rejection.ScheduleRevision != 2 ||
+		rejection.Status != domain.StatusCancelled {
+		t.Fatalf("old cancelled revision was not fenced: rejection=%+v err=%v", rejection, err)
 	}
 }

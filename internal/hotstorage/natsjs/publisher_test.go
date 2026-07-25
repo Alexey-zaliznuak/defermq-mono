@@ -2,7 +2,6 @@ package natsjs
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 
@@ -21,14 +20,14 @@ func (p *recordingPublisher) PublishMsg(_ context.Context, msg *nats.Msg, _ ...j
 	return &jetstream.PubAck{Stream: "DEFERMQ", Sequence: 1}, nil
 }
 
-func TestPublisherDecisionAndScheduledHeaders(t *testing.T) {
+func TestPublisherPublishesOnlyReadySubject(t *testing.T) {
 	now := time.Date(2026, 7, 25, 12, 0, 0, 123, time.UTC)
 	id := uuid.New()
 	recorder := &recordingPublisher{}
 	publisher := NewPublisher(recorder, Subjects{"defermq.schedule", "defermq.ready"})
 	publisher.now = func() time.Time { return now }
 	request := PublishRequest{
-		Kind:             OutboxSchedule,
+		Kind:             OutboxReady,
 		DeliveryID:       id,
 		ScheduleRevision: 3,
 		DeliverAt:        now.Add(time.Minute),
@@ -37,23 +36,22 @@ func TestPublisherDecisionAndScheduledHeaders(t *testing.T) {
 	if err := publisher.Publish(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
-	if recorder.message.Subject != "defermq.schedule."+id.String() {
-		t.Fatalf("unexpected schedule subject %q", recorder.message.Subject)
-	}
-	if got := recorder.message.Header.Get(jetstream.ScheduleTargetHeader); got != "defermq.ready.http" {
-		t.Fatalf("unexpected target %q", got)
-	}
-	if got := recorder.message.Header.Get(jetstream.ScheduleHeader); !strings.HasPrefix(got, "@at 2026-07-25T12:01:00") {
-		t.Fatalf("unexpected schedule header %q", got)
+	if recorder.message.Subject != "defermq.ready.http" {
+		t.Fatalf("unexpected ready subject %q", recorder.message.Subject)
 	}
 
-	request.DeliverAt = now
+	request.Kind = OutboxHotRegister
+	_, err := publisher.Decide(request, now)
+	if err == nil {
+		t.Fatal("hot-register outbox was accepted by NATS publisher")
+	}
+	request.Kind = OutboxReady
 	decision, err := publisher.Decide(request, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if decision.Scheduled || decision.Subject != "defermq.ready.http" {
-		t.Fatalf("due schedule was not converted to direct ready: %+v", decision)
+		t.Fatalf("ready decision is invalid: %+v", decision)
 	}
 }
 

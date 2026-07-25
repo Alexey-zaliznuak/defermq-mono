@@ -1,27 +1,35 @@
 # DeferMQ
 
-DeferMQ — прототип open-source брокера отложенных сообщений. Клиент задаёт точное
-`deliver_at`, DeferMQ надёжно сохраняет состояние и payload в PostgreSQL, переносит
-ближайшие сообщения в NATS JetStream и доставляет их в HTTP, Kafka, RabbitMQ или
-PostgreSQL.
+DeferMQ — прототип open-source брокера отложенных сообщений. Клиент задаёт
+`deliver_at`, а DeferMQ доставляет payload в HTTP, Kafka, RabbitMQ или PostgreSQL.
+
+Путь новой команды короткий: **Gateway → durable NATS ingest → пакетная запись в
+PostgreSQL**. Расписание живёт в PostgreSQL, ближайшие события индексируются в
+Valkey, а NATS используется только для ingest и ready events.
 
 > Статус проекта: **prototype**. API, схема данных и operational defaults могут
 > меняться до первого стабильного релиза.
 
 ## Гарантии доставки
 
-1. После успешного ответа Gateway delivery и payload зафиксированы в PostgreSQL.
-2. PostgreSQL — единственный source of truth. JetStream — восстанавливаемый горячий
-   слой и durable ready queue.
-3. DeferMQ намеренно не отправляет сообщение раньше `deliver_at`. После этого
+1. Gateway возвращает `202 Accepted` только после JetStream `PubAck`. В этот
+   момент команда уже durable в ingest stream, но batch writer может ещё не
+   записать её в PostgreSQL.
+2. После commit PostgreSQL становится source of truth для delivery и payload.
+   До commit API читает временное pending-состояние из NATS KV.
+3. Ingest consumer отправляет ACK только после успешного commit PostgreSQL.
+   При ошибке commit команда остаётся в JetStream и выдаётся повторно.
+4. DeferMQ намеренно не отправляет сообщение раньше `deliver_at`. После этого
    времени возможна положительная задержка из-за нагрузки или недоступности систем.
-4. Семантика доставки — **at-least-once**. Повтор возможен, если destination принял
+5. Семантика доставки — **at-least-once**. Повтор возможен, если destination принял
    сообщение, а Pusher завершился до записи результата в PostgreSQL.
-5. Стабильный `delivery_id` передаётся downstream как idempotency key.
-6. Transactional outbox защищает границу PostgreSQL → NATS; `schedule_revision`
+6. Стабильный `delivery_id` передаётся downstream как idempotency key.
+7. Transactional outbox защищает границу PostgreSQL → ready NATS; `schedule_revision`
    отсекает устаревшие события после отмены или переноса.
-7. Потеря данных NATS восстанавливается overdue reconciliation из PostgreSQL.
-   Потеря PostgreSQL без резервной копии необратима.
+8. Valkey — восстанавливаемый быстрый индекс, а не источник данных. Repairer
+   заново наполняет его из PostgreSQL.
+9. Потеря ready events NATS восстанавливается overdue reconciliation из
+   PostgreSQL. Потеря PostgreSQL после ingest commit без резервной копии необратима.
 
 Exactly-once для произвольных внешних систем не обещается. Получатель должен
 дедуплицировать запросы по `delivery_id`.
@@ -32,26 +40,34 @@ Exactly-once для произвольных внешних систем не о
 sequenceDiagram
     participant C as Client
     participant G as Gateway
-    participant PG as PostgreSQL
-    participant M as Postgres Manager
     participant JS as NATS JetStream
+    participant M as Postgres Manager
+    participant PG as PostgreSQL
+    participant V as Valkey
     participant P as Pusher
     participant D as Destination
 
     C->>G: POST /v1/messages
-    G->>PG: payload + delivery (+ outbox if hot)
-    PG-->>G: COMMIT
+    G->>JS: ingest command
+    JS-->>G: PubAck
     G-->>C: 202 Accepted
+    Note over G,JS: GET/PATCH/DELETE видят pending через NATS KV
 
-    loop until hot horizon is drained
-        M->>PG: candidates → transactional outbox
+    JS->>M: durable ingest batch
+    M->>PG: payload + delivery, один batch commit
+    PG-->>M: COMMIT
+    M->>JS: ACK ingest batch
+
+    loop deliver_at попал в horizon 10s
+        M->>PG: candidates → hot_register outbox
+        M->>V: register in one of 32 buckets
     end
-    M->>PG: claim outbox
-    M->>JS: scheduled/ready publish
-    JS-->>M: PubAck
-    M->>PG: mark outbox published
 
-    JS->>P: ready event near deliver_at
+    M->>V: 10 scheduler workers claim due entries
+    M->>JS: ready event
+    JS-->>M: PubAck
+    M->>PG: mark ready published
+    JS->>P: ready event
     P->>PG: claim delivery + load payload
     P->>D: push with delivery_id
     D-->>P: result
@@ -61,26 +77,52 @@ sequenceDiagram
 
 Три исполняемых файла имеют разные роли:
 
-- `defermq-gateway` — REST API, валидация, idempotent create, status, отмена и
-  перенос. Gateway зависит от PostgreSQL, но принимает сообщения при недоступном
-  NATS благодаря outbox.
-- `defermq-postgres-manager` — promotion в hot horizon, публикация outbox с
-  JetStream PubAck, reconciliation, reaping leases и retention.
+- `defermq-gateway` — REST API, валидация и публикация create/cancel/reschedule
+  команд в durable ingest stream. Для idempotency и pending API он использует
+  стабильные ID и NATS KV.
+- `defermq-postgres-manager` — batch ingest writer, promotion в hot horizon,
+  регистрация и планирование через Valkey, ready outbox, repair/reconciliation,
+  reaping leases и retention.
 - `defermq-pusher` — durable pull consumers, PostgreSQL claim, worker pools,
   destination adapters, application retries и terminal state.
 
 ### Hot horizon
 
-Далёкая delivery хранится только в PostgreSQL. Когда
-`deliver_at <= database_now + DEFERMQ_HOT_HORIZON`, Manager создаёт outbox и
-публикует scheduled event в JetStream. NATS выпускает ready event около
-`deliver_at`. Если scheduled event потерян, overdue reconciler создаёт direct
-ready event. Payload никогда не передаётся через NATS.
+Далёкая delivery хранится только в PostgreSQL. За
+`DEFERMQ_HOT_HORIZON=10s` до срока Manager создаёт `hot_register` outbox и
+регистрирует delivery в одном из `DEFERMQ_VALKEY_BUCKETS=32` стабильных buckets.
+По умолчанию `DEFERMQ_MANAGER_SCHEDULER_WORKERS=10` workers делят buckets между
+собой, забирают наступившие записи и публикуют только ready event.
+
+В Valkey нет payload. Если Valkey очищен или перезапущен, repairer восстанавливает
+индекс из PostgreSQL. NATS не используется как таймер: в нём есть только durable
+ingest commands, временный pending KV и ready events.
+
+### Окна отказов
+
+- **До PubAck:** Gateway не возвращает `202`. Клиент повторяет запрос с тем же
+  `Idempotency-Key`.
+- **После PubAck, до ответа HTTP:** результат для клиента неоднозначен. Повтор с
+  тем же ключом безопасен: delivery ID вычисляется стабильно.
+- **После `202`, до commit PostgreSQL:** GET возвращает pending-представление из
+  NATS KV. PATCH и DELETE публикуют следующую команду в тот же стабильный shard,
+  поэтому порядок одной delivery сохраняется.
+- **Ошибка PostgreSQL до commit:** ingest writer делает NAK; команда будет выдана
+  снова. В PostgreSQL нет частично записанного batch.
+- **Commit прошёл, ACK потерян:** JetStream может повторить команду. Запись в
+  PostgreSQL идемпотентна, поэтому повтор не создаёт вторую delivery.
+- **Valkey недоступен:** durable расписание остаётся в PostgreSQL, но ready
+  публикация задерживается. После восстановления repairer и overdue reconciler
+  возвращают работу.
+- **Ready PubAck получен, но PostgreSQL ещё не обновлён:** возможен повтор ready
+  event. Pusher проверяет `schedule_revision` и состояние в PostgreSQL.
+- **Destination принял запрос, а запись результата не завершилась:** внешняя
+  доставка может повториться. Получатель обязан дедуплицировать по `delivery_id`.
 
 ## Требования
 
 - Docker Engine 28+ и Docker Compose v2 для рекомендуемого запуска;
-- либо Go 1.26.x, PostgreSQL и NATS Server 2.12+ для локальной разработки;
+- либо Go 1.26.x, PostgreSQL, NATS Server 2.12+ и Valkey 8+ для локальной разработки;
 - Task 3.x (`task`) для developer-команд.
 
 SQL-миграции встроены в бинарники и применяются при
@@ -96,13 +138,14 @@ docker compose -f deploy/compose/docker-compose.build.yml up --build -d
 docker compose -f deploy/compose/docker-compose.build.yml ps
 ```
 
-Core-профиль запускает source PostgreSQL, NATS и три DeferMQ-сервиса. Порты
+Core-профиль запускает source PostgreSQL, NATS, Valkey и три DeferMQ-сервиса. Порты
 публикуются только на loopback:
 
 - Gateway: `http://127.0.0.1:8080`;
 - Manager admin: `http://127.0.0.1:8081`;
 - Pusher admin: `http://127.0.0.1:8082`;
 - NATS monitoring: `http://127.0.0.1:8222`.
+- Valkey: `127.0.0.1:6379`.
 
 Остановка сохраняет persistent volumes:
 
@@ -157,6 +200,11 @@ curl --fail-with-body -i http://127.0.0.1:8080/v1/messages \
 
 Повтор с тем же `Idempotency-Key` возвращает существующую delivery и
 `Idempotent-Replay: true`. Глобальная уникальность ключа — ограничение прототипа.
+
+Сразу после `202` статус может ещё не существовать в PostgreSQL. Это нормально:
+`GET /v1/messages/{id}` сначала проверяет PostgreSQL, затем pending-состояние в
+NATS KV. Ответ имеет ту же форму и обычно содержит `status: scheduled`. После
+batch commit Gateway удаляет устаревшую pending-запись при следующем чтении.
 
 ```bash
 DELIVERY_ID=0198f4f4-1b9e-7d3e-9c65-96c7af740db1
@@ -282,8 +330,9 @@ Kafka и RabbitMQ получают эквивалентные headers; target Po
 
 У каждого бинаря доступны `GET /livez`, `GET /readyz` и `GET /metrics`.
 Liveness не обращается к сети. Readiness проверяет необходимые зависимости:
-Gateway — PostgreSQL; Manager — PostgreSQL, NATS и совместимость stream; Pusher —
-PostgreSQL, NATS, consumers и включённые глобальные adapters.
+Gateway — PostgreSQL, NATS и schema; Manager — PostgreSQL, NATS, Valkey,
+совместимость stream и heartbeat критических loops; Pusher — PostgreSQL, NATS,
+consumers и включённые глобальные adapters.
 
 Prometheus scrape targets:
 
@@ -296,24 +345,49 @@ Prometheus scrape targets:
 Основные группы метрик:
 
 - Gateway: HTTP rate/latency/size, created/replayed/cancelled/rescheduled;
-- Manager: promoter batches, outbox publish, overdue/reaper/retention,
+- Manager ingest: размер batch, commit latency/result/rows, redelivery и DLQ;
+- Manager scheduling: promoter/registrar/scheduler/repairer, Valkey errors,
+  sampled depth `schedule`/`inflight` buckets и wake lag;
+- Manager recovery: ready outbox, overdue/reaper/retention,
   `unpromoted_headroom_seconds`, pending и oldest outbox;
 - Pusher: received/claims/attempts/retries/dead, inflight, start/completion lag,
   early events и consumer pending;
 - все сервисы: `defermq_build_info`, dependency readiness, Go/process и pgxpool.
 
 `/metrics` не выполняет SQL: DB/NATS gauges обновляют фоновые collectors.
-Практичные alerts: readiness дольше нескольких минут; pending/oldest outbox
-растёт; unpromoted headroom приближается к нулю; processing expired > 0; delivery
-lag или dead rate растёт; metrics collector success равен 0.
+Практичные alerts: readiness дольше нескольких минут; ingest commit errors,
+redeliveries или DLQ растут; pending/oldest ready outbox растёт; Valkey errors или
+scheduler wake lag растут; unpromoted headroom приближается к нулю; processing
+expired > 0; delivery lag/dead rate растёт; metrics collector success равен 0.
 
 ## Конфигурация
 
-Полный каталог переменных с русскими комментариями, форматами и безопасными
-production-рекомендациями находится в `.env.example`. Общие значения PostgreSQL,
-NATS, subject prefixes, hot horizon и payload limit должны быть согласованы между
-тремя процессами. Credentials передавайте через secret manager или mounted files,
-а не коммитьте в `.env`.
+Полный каталог переменных с русскими комментариями находится в `.env.example`.
+Особенно важны группы `DEFERMQ_GATEWAY_INGEST_*`,
+`DEFERMQ_MANAGER_INGEST_*`, `DEFERMQ_NATS_INGEST_*`,
+`DEFERMQ_VALKEY_*`, `DEFERMQ_MANAGER_SCHEDULER_*` и
+`DEFERMQ_HOT_HORIZON`. Общие stream/subject, horizon и payload limits должны
+совпадать между процессами. Credentials передавайте через secret manager или
+mounted files, а не коммитьте в `.env`.
+
+Manager по умолчанию запускает 8 ingest writers для 32 shard subjects. Writer
+`N` единолично читает shards, для которых `shard % workers == N`; отдельный
+durable consumer с несколькими `FilterSubjects` сохраняет stream order этого
+набора. Поэтому `DEFERMQ_MANAGER_INGEST_SHARDS` должен совпадать с
+`DEFERMQ_GATEWAY_INGEST_SHARDS`, а число writers не может превышать число shards.
+Каждый writer накапливает до `DEFERMQ_MANAGER_INGEST_BATCH_SIZE=500` команд или
+делает commit через `DEFERMQ_MANAGER_INGEST_FLUSH_INTERVAL=500ms` после первой
+команды; `DEFERMQ_MANAGER_INGEST_MAX_ACK_PENDING=2000` оставляет запас для
+неподтверждённых batch. Настройки Gateway остаются `100` команд и `100ms`.
+
+При обновлении со старого wildcard consumer нельзя одновременно запускать
+старый и sharded Manager: оба набора durable consumers прочитают одни команды.
+Сначала остановите все Manager старой версии. Затем на одном запуске новой
+версии задайте `DEFERMQ_MANAGER_INGEST_DELETE_LEGACY_DURABLE=true`, чтобы удалить
+durable из `DEFERMQ_MANAGER_INGEST_DURABLE`; после успешного старта верните
+значение `false`. Новые consumers начинают с legacy `AckFloor + 1`, включая все
+ранее неподтверждённые команды. Без явного разрешения новая версия обнаружит
+legacy consumer и завершит запуск с ошибкой, не создавая sharded consumers.
 
 ## Разработка
 
@@ -322,15 +396,24 @@ task --list
 task deps
 task fmt
 task vet
-task test
-task test-race
+task unit
+task fault
 task lint
 task build
 task test-integration
+task test-e2e
+task full
+task config-check
+task load-smoke
+# Нагрузочный профиль, запускайте только осознанно:
+task load-1000rps
 ```
 
 `task lint` ожидает `golangci-lint` в `PATH`; migration tasks — `goose`.
-Integration tests могут требовать Docker. Отдельные команды:
+`task full` не запускает load test, но ожидает уже поднятый Compose для core
+integration и E2E. `task fault` — быстрые детерминированные проверки ключевых
+окон отказов; это не chaos test с остановкой контейнеров. Integration tests могут
+требовать Docker. Отдельные команды:
 
 - `DEFERMQ_TEST_POSTGRES_DSN` включает repository integration tests;
 - `DEFERMQ_NATS_INTEGRATION_URL` включает JetStream scheduling test;
@@ -353,6 +436,10 @@ task migrate-status
 
 Build information (`version`, `commit`, `build time`) передаётся через ldflags и
 публикуется в liveness/startup logs/`defermq_build_info`.
+
+Подробная пирамида тестов, fault-проверки, параметры распределений, resource
+sampling, assertions и формат load-test отчёта описаны в
+[TESTING.MD](TESTING.MD).
 
 ## Security
 
@@ -377,7 +464,11 @@ Build information (`version`, `commit`, `build time`) передаётся че�
 - Нет пользовательской авторизации, multi-tenancy, quotas, billing и UI.
 - Нет recurring/cron messages и массовых кампаний.
 - Нет exactly-once для внешних HTTP/Kafka/RabbitMQ; возможен ambiguous success.
-- PostgreSQL — единственный cold storage backend и единая точка сохранности.
+- После ingest commit PostgreSQL — единственный cold storage backend и единая
+  точка сохранности; до commit durable команда хранится в NATS.
+- Pending API опирается на NATS KV с ограниченным TTL и не заменяет PostgreSQL.
+- Valkey не хранит payload и может быть восстановлен, но его отказ увеличивает
+  задержку ready delivery.
 - Payload целиком читается в память, но ограничен `DEFERMQ_MAX_PAYLOAD_BYTES`.
 - Exact DB counts фоновых metrics collectors могут стать дорогими на очень
   больших таблицах.

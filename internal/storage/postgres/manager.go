@@ -30,7 +30,7 @@ func (s *Store) PromotionCutoff(ctx context.Context, hotHorizon time.Duration) (
 	return cutoff.UTC(), nil
 }
 
-// PromoteBatch creates schedule outbox records for the next ordered candidate
+// PromoteBatch creates hot-register outbox records for the next ordered candidate
 // batch. Candidates that already have an outbox row are excluded, preventing a
 // conflict from making a drain cycle spin forever.
 func (s *Store) PromoteBatch(ctx context.Context, cutoff time.Time, limit int) (PromotionResult, error) {
@@ -45,13 +45,14 @@ func (s *Store) PromoteBatch(ctx context.Context, cutoff time.Time, limit int) (
 			SELECT d.id, d.schedule_revision, d.deliver_at, d.destination_type
 			FROM deliveries d
 			WHERE d.status = 'scheduled'
+			  AND d.deliver_at > clock_timestamp()
 			  AND d.deliver_at <= $1
 			  AND d.hot_registered_revision IS DISTINCT FROM d.schedule_revision
 			  AND NOT EXISTS (
 				SELECT 1 FROM nats_outbox o
 				WHERE o.delivery_id = d.id
 				  AND o.schedule_revision = d.schedule_revision
-				  AND o.kind = 'schedule'
+				  AND o.kind = 'hot_register'
 			  )
 			ORDER BY d.deliver_at, d.id
 			LIMIT $2
@@ -60,7 +61,7 @@ func (s *Store) PromoteBatch(ctx context.Context, cutoff time.Time, limit int) (
 			INSERT INTO nats_outbox (
 				delivery_id, schedule_revision, kind, deliver_at, destination_type
 			)
-			SELECT id, schedule_revision, 'schedule', deliver_at, destination_type
+			SELECT id, schedule_revision, 'hot_register', deliver_at, destination_type
 			FROM candidates
 			ON CONFLICT (delivery_id, schedule_revision, kind) DO NOTHING
 			RETURNING 1
@@ -82,7 +83,7 @@ func (s *Store) ClaimOutbox(ctx context.Context, owner string, limit int, lockTT
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
 	rows, err := s.pool.Query(ctx, `
-		WITH picked AS (
+		WITH picked AS MATERIALIZED (
 			SELECT id
 			FROM nats_outbox
 			WHERE published_at IS NULL
@@ -130,27 +131,65 @@ func (s *Store) MarkOutboxPublished(ctx context.Context, id int64, owner string)
 	var revision int64
 	var kind OutboxKind
 	err = tx.QueryRow(ctx, `
-		UPDATE nats_outbox
-		SET published_at = clock_timestamp(),
-			locked_by = NULL,
-			locked_until = NULL,
-			last_error = NULL
+		SELECT delivery_id, schedule_revision, kind
+		FROM nats_outbox
 		WHERE id = $1 AND locked_by = $2 AND published_at IS NULL
-		RETURNING delivery_id, schedule_revision, kind`,
+		ORDER BY id
+		FOR UPDATE`,
 		id, owner).Scan(&deliveryID, &revision, &kind)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.ErrOwnershipLost
 	}
 	if err != nil {
+		return fmt.Errorf("lock outbox completion: %w", err)
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE nats_outbox
+		SET published_at = clock_timestamp(),
+			locked_by = NULL,
+			locked_until = NULL,
+			last_error = NULL
+		WHERE id = $1 AND locked_by = $2 AND published_at IS NULL`,
+		id, owner)
+	if err != nil {
 		return fmt.Errorf("mark outbox published: %w", err)
 	}
-	if kind == OutboxSchedule {
+	if tag.RowsAffected() == 0 {
+		return domain.ErrOwnershipLost
+	}
+	if kind == OutboxHotRegister {
+		if _, err := tx.Exec(ctx, `
+			SELECT id
+			FROM deliveries
+			WHERE id = $1 AND schedule_revision = $2 AND status = 'scheduled'
+			ORDER BY id
+			FOR UPDATE`, deliveryID, revision); err != nil {
+			return fmt.Errorf("lock delivery hot registration: %w", err)
+		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE deliveries
 			SET hot_registered_revision = $2, updated_at = clock_timestamp()
 			WHERE id = $1 AND schedule_revision = $2 AND status = 'scheduled'`,
 			deliveryID, revision); err != nil {
 			return fmt.Errorf("mark delivery hot registration: %w", err)
+		}
+	} else if kind == OutboxReady {
+		if _, err := tx.Exec(ctx, `
+			SELECT id
+			FROM deliveries
+			WHERE id = $1 AND schedule_revision = $2 AND status = 'scheduled'
+			ORDER BY id
+			FOR UPDATE`, deliveryID, revision); err != nil {
+			return fmt.Errorf("lock delivery ready publication: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE deliveries
+			SET ready_published_revision = $2,
+				ready_published_at = clock_timestamp(),
+				updated_at = clock_timestamp()
+			WHERE id = $1 AND schedule_revision = $2 AND status = 'scheduled'`,
+			deliveryID, revision); err != nil {
+			return fmt.Errorf("mark delivery ready publication: %w", err)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -193,11 +232,12 @@ func (s *Store) ReconcileOverdue(ctx context.Context, grace time.Duration, limit
 	ctx, cancel := s.withTimeout(ctx)
 	defer cancel()
 	tag, err := s.pool.Exec(ctx, `
-		WITH candidates AS (
+		WITH candidates AS MATERIALIZED (
 			SELECT id, schedule_revision, deliver_at, destination_type
 			FROM deliveries
 			WHERE status = 'scheduled'
 			  AND deliver_at <= clock_timestamp() - $1 * interval '1 millisecond'
+			  AND ready_published_revision IS DISTINCT FROM schedule_revision
 			ORDER BY deliver_at, id
 			LIMIT $2
 			FOR UPDATE SKIP LOCKED
@@ -306,7 +346,7 @@ func (s *Store) CleanupRetention(
 		return RetentionResult{}, fmt.Errorf("delete retained deliveries: %w", err)
 	}
 	tag, err := tx.Exec(ctx, `
-		WITH victims AS (
+		WITH victims AS MATERIALIZED (
 			SELECT id
 			FROM nats_outbox
 			WHERE published_at IS NOT NULL

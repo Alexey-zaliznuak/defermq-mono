@@ -17,7 +17,7 @@ type Message interface {
 
 type Consumer interface {
 	Type() domain.DestinationType
-	Fetch(context.Context, int, time.Duration) ([]Message, error)
+	Next(context.Context) (Message, error)
 	Ready(context.Context) error
 	Close(context.Context) error
 }
@@ -36,21 +36,25 @@ const (
 type ClaimResult struct {
 	Reason   ClaimReason
 	Delivery *domain.Delivery
+	Payload  *domain.Payload
 	Wait     time.Duration
+}
+
+type ClaimRequest struct {
+	DeliveryID       uuid.UUID
+	ScheduleRevision int64
 }
 
 // Repository is intentionally declared by the Pusher consumer. Every state
 // transition must commit before the caller acknowledges the ready message.
 type Repository interface {
-	Claim(
+	ClaimBatch(
 		context.Context,
-		uuid.UUID,
-		int64,
+		[]ClaimRequest,
 		string,
 		time.Duration,
 		time.Duration,
-	) (ClaimResult, error)
-	LoadPayload(context.Context, uuid.UUID, int64) (domain.Payload, error)
+	) ([]ClaimResult, error)
 	Heartbeat(context.Context, uuid.UUID, string, time.Duration) (bool, error)
 	MarkDelivered(context.Context, uuid.UUID, string) (bool, error)
 	ScheduleRetry(

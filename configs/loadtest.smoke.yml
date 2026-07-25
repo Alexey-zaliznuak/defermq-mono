@@ -1,0 +1,68 @@
+name: docker-smoke
+seed: 42
+
+gateway:
+  url: http://127.0.0.1:8080
+  timeout: 10s
+
+receiver:
+  listen_address: 127.0.0.1:18080
+  public_url: http://host.docker.internal:18080
+  path: /defermq
+
+load:
+  create_concurrency: 16
+  status_concurrency: 16
+  poll_interval: 200ms
+  await_timeout: 2m
+  warmup: 2s
+  cooldown: 2s
+  early_tolerance: 100ms
+
+resources:
+  enabled: true
+  sample_interval: 1s
+  command_timeout: 10s
+  compose_project: defermq
+  go_services: [gateway, postgres-manager, pusher]
+  non_go_services: [postgres, nats, valkey]
+
+assertions:
+  max_create_errors: 0
+  max_action_errors: 0
+  max_missing: 0
+  max_duplicates: 0
+  max_early_deliveries: 0
+  min_delivery_success_rate: 1
+  max_delivery_lag: 10s
+
+report:
+  directory: test-results/load/smoke
+  json_file: report.json
+  markdown_file: report.md
+  include_resource_samples: true
+
+message_groups:
+  - name: direct
+    count: 30
+    admission_offset: {mean: 1s, stddev: 500ms, min: 0s, max: 2s}
+    delivery_delay: {mean: 5s, stddev: 1s, min: 3s, max: 8s}
+    payload_bytes: 256
+    max_attempts: 5
+    fail_first_attempts: 0
+    failure_status: 503
+    cancel_fraction: 0.1
+    reschedule_fraction: 0.1
+    reschedule_delay: {mean: 2s, stddev: 500ms, min: 1s, max: 3s}
+
+  - name: retry
+    count: 10
+    admission_offset: {mean: 2s, stddev: 200ms, min: 1s, max: 3s}
+    delivery_delay: {mean: 4s, stddev: 500ms, min: 3s, max: 6s}
+    payload_bytes: 1024
+    max_attempts: 5
+    fail_first_attempts: 1
+    failure_status: 503
+    cancel_fraction: 0
+    reschedule_fraction: 0
+    reschedule_delay: {mean: 0s, stddev: 0s, min: 0s, max: 0s}

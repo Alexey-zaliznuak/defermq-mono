@@ -80,6 +80,9 @@ type NATS struct {
 	DuplicateWindow       time.Duration
 	ScheduleSubjectPrefix string
 	ReadySubjectPrefix    string
+	IngestStream          string
+	IngestSubject         string
+	IngestPendingBucket   string
 	User                  string
 	Password              string
 	CredentialsFile       string
@@ -99,6 +102,10 @@ type GatewayConfig struct {
 	MaxHeaderBytes         int
 	DefaultMaxAttempts     int
 	MaxIdempotencyKeyBytes int
+	IngestBatchSize        int
+	IngestFlushInterval    time.Duration
+	IngestQueueCapacity    int
+	IngestShardCount       int
 }
 
 type Manager struct {
@@ -122,12 +129,22 @@ type Manager struct {
 	OutboxRetention           time.Duration
 	RetentionBatchSize        int
 	MetricsCollectionInterval time.Duration
+	IngestWorkers             int
+	IngestShards              int
+	IngestDeleteLegacyDurable bool
+	IngestBatchSize           int
+	IngestFlushInterval       time.Duration
+	IngestAckWait             time.Duration
+	IngestMaxAckPending       int
+	IngestMaxDeliver          int
 }
 
 type Pusher struct {
 	HTTPAddr                  string
 	FetchBatchSize            int
 	FetchMaxWait              time.Duration
+	ClaimBatchSize            int
+	ClaimFlushInterval        time.Duration
 	WorkersHTTP               int
 	WorkersKafka              int
 	WorkersRabbit             int
@@ -224,7 +241,7 @@ func LoadFromLookup(service Service, lookup LookupFunc) (Config, error) {
 				SamplingEnabled: r.boolean("DEFERMQ_LOG_SAMPLING_ENABLED", true),
 			},
 			ShutdownTimeout:     r.duration("DEFERMQ_SHUTDOWN_TIMEOUT", 20*time.Second),
-			HotHorizon:          r.duration("DEFERMQ_HOT_HORIZON", 2*time.Minute),
+			HotHorizon:          r.duration("DEFERMQ_HOT_HORIZON", 10*time.Second),
 			MaxPayloadBytes:     r.int64("DEFERMQ_MAX_PAYLOAD_BYTES", 1<<20),
 			EnabledDestinations: r.list("DEFERMQ_ENABLED_DESTINATIONS", []string{"http", "kafka", "rabbit", "postgres"}),
 		},
@@ -255,6 +272,9 @@ func LoadFromLookup(service Service, lookup LookupFunc) (Config, error) {
 			DuplicateWindow:       r.duration("DEFERMQ_NATS_DUPLICATE_WINDOW", 10*time.Minute),
 			ScheduleSubjectPrefix: r.text("DEFERMQ_NATS_SCHEDULE_SUBJECT_PREFIX", "defermq.schedule"),
 			ReadySubjectPrefix:    r.text("DEFERMQ_NATS_READY_SUBJECT_PREFIX", "defermq.ready"),
+			IngestStream:          r.text("DEFERMQ_NATS_INGEST_STREAM", "DEFERMQ_INGEST_V2"),
+			IngestSubject:         r.text("DEFERMQ_NATS_INGEST_SUBJECT", "defermq.ingest.v2.commands"),
+			IngestPendingBucket:   r.text("DEFERMQ_NATS_INGEST_PENDING_BUCKET", "DEFERMQ_INGEST_PENDING"),
 			User:                  r.text("DEFERMQ_NATS_USER", ""),
 			Password:              r.text("DEFERMQ_NATS_PASSWORD", ""),
 			CredentialsFile:       r.text("DEFERMQ_NATS_CREDS_FILE", ""),
@@ -273,6 +293,10 @@ func LoadFromLookup(service Service, lookup LookupFunc) (Config, error) {
 			MaxHeaderBytes:         r.integer("DEFERMQ_GATEWAY_MAX_HEADER_BYTES", 1<<20),
 			DefaultMaxAttempts:     r.integer("DEFERMQ_GATEWAY_DEFAULT_MAX_ATTEMPTS", 10),
 			MaxIdempotencyKeyBytes: r.integer("DEFERMQ_GATEWAY_MAX_IDEMPOTENCY_KEY_BYTES", 200),
+			IngestBatchSize:        r.integer("DEFERMQ_GATEWAY_INGEST_BATCH_SIZE", 100),
+			IngestFlushInterval:    r.duration("DEFERMQ_GATEWAY_INGEST_FLUSH_INTERVAL", 100*time.Millisecond),
+			IngestQueueCapacity:    r.integer("DEFERMQ_GATEWAY_INGEST_QUEUE_CAPACITY", 1000),
+			IngestShardCount:       r.integer("DEFERMQ_GATEWAY_INGEST_SHARDS", 32),
 		},
 		Manager: Manager{
 			HTTPAddr:                  r.text("DEFERMQ_MANAGER_HTTP_ADDR", ":8081"),
@@ -295,11 +319,21 @@ func LoadFromLookup(service Service, lookup LookupFunc) (Config, error) {
 			OutboxRetention:           r.duration("DEFERMQ_MANAGER_OUTBOX_RETENTION", 24*time.Hour),
 			RetentionBatchSize:        r.integer("DEFERMQ_MANAGER_RETENTION_BATCH_SIZE", 1000),
 			MetricsCollectionInterval: r.duration("DEFERMQ_MANAGER_METRICS_COLLECTION_INTERVAL", 5*time.Second),
+			IngestWorkers:             r.integer("DEFERMQ_MANAGER_INGEST_WORKERS", 8),
+			IngestShards:              r.integer("DEFERMQ_MANAGER_INGEST_SHARDS", 32),
+			IngestDeleteLegacyDurable: r.boolean("DEFERMQ_MANAGER_INGEST_DELETE_LEGACY_DURABLE", false),
+			IngestBatchSize:           r.integer("DEFERMQ_MANAGER_INGEST_BATCH_SIZE", 500),
+			IngestFlushInterval:       r.duration("DEFERMQ_MANAGER_INGEST_FLUSH_INTERVAL", 500*time.Millisecond),
+			IngestAckWait:             r.duration("DEFERMQ_MANAGER_INGEST_ACK_WAIT", 30*time.Second),
+			IngestMaxAckPending:       r.integer("DEFERMQ_MANAGER_INGEST_MAX_ACK_PENDING", 2000),
+			IngestMaxDeliver:          r.integer("DEFERMQ_MANAGER_INGEST_MAX_DELIVER", 20),
 		},
 		Pusher: Pusher{
 			HTTPAddr:                  r.text("DEFERMQ_PUSHER_HTTP_ADDR", ":8082"),
 			FetchBatchSize:            r.integer("DEFERMQ_PUSHER_FETCH_BATCH_SIZE", 100),
 			FetchMaxWait:              r.duration("DEFERMQ_PUSHER_FETCH_MAX_WAIT", 2*time.Second),
+			ClaimBatchSize:            r.integer("DEFERMQ_PUSHER_CLAIM_BATCH_SIZE", 100),
+			ClaimFlushInterval:        r.duration("DEFERMQ_PUSHER_CLAIM_FLUSH_INTERVAL", 10*time.Millisecond),
 			WorkersHTTP:               r.integer("DEFERMQ_PUSHER_WORKERS_HTTP", 32),
 			WorkersKafka:              r.integer("DEFERMQ_PUSHER_WORKERS_KAFKA", 8),
 			WorkersRabbit:             r.integer("DEFERMQ_PUSHER_WORKERS_RABBIT", 8),
@@ -322,8 +356,8 @@ func LoadFromLookup(service Service, lookup LookupFunc) (Config, error) {
 			TLSHandshakeTimeout:   r.duration("DEFERMQ_HTTP_TLS_HANDSHAKE_TIMEOUT", 5*time.Second),
 			ResponseHeaderTimeout: r.duration("DEFERMQ_HTTP_RESPONSE_HEADER_TIMEOUT", 10*time.Second),
 			IdleConnTimeout:       r.duration("DEFERMQ_HTTP_IDLE_CONN_TIMEOUT", 90*time.Second),
-			MaxIdleConns:          r.integer("DEFERMQ_HTTP_MAX_IDLE_CONNS", 200),
-			MaxIdleConnsPerHost:   r.integer("DEFERMQ_HTTP_MAX_IDLE_CONNS_PER_HOST", 20),
+			MaxIdleConns:          r.integer("DEFERMQ_HTTP_MAX_IDLE_CONNS", 1000),
+			MaxIdleConnsPerHost:   r.integer("DEFERMQ_HTTP_MAX_IDLE_CONNS_PER_HOST", 200),
 			MaxResponseBodyBytes:  r.int64("DEFERMQ_HTTP_MAX_RESPONSE_BODY_BYTES", 65536),
 			AllowPrivateNetworks:  r.boolean("DEFERMQ_HTTP_ALLOW_PRIVATE_NETWORKS", true),
 			AllowedHosts:          r.list("DEFERMQ_HTTP_ALLOWED_HOSTS", nil),

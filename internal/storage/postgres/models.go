@@ -14,8 +14,8 @@ import (
 type OutboxKind string
 
 const (
-	OutboxSchedule OutboxKind = "schedule"
-	OutboxReady    OutboxKind = "ready"
+	OutboxHotRegister OutboxKind = "hot_register"
+	OutboxReady       OutboxKind = "ready"
 )
 
 type OutboxItem struct {
@@ -52,6 +52,18 @@ type ClaimDeliveryParams struct {
 	Owner              string
 	Lease              time.Duration
 	ClockSkewTolerance time.Duration
+}
+
+type ClaimRequest struct {
+	DeliveryID       uuid.UUID
+	ScheduleRevision int64
+}
+
+type BatchClaimResult struct {
+	Delivery *domain.Delivery
+	Payload  *domain.Payload
+	Reason   string
+	Wait     time.Duration
 }
 
 type RetryDeliveryParams struct {

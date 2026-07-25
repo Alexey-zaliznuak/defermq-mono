@@ -43,7 +43,7 @@ func TestOutboxKindFor(t *testing.T) {
 	}{
 		{name: "overdue is ready", deliverAt: now.Add(-time.Second), horizon: time.Minute, want: OutboxReady, wantOK: true},
 		{name: "exactly now is ready", deliverAt: now, horizon: time.Minute, want: OutboxReady, wantOK: true},
-		{name: "horizon boundary is schedule", deliverAt: now.Add(time.Minute), horizon: time.Minute, want: OutboxSchedule, wantOK: true},
+		{name: "horizon boundary is hot register", deliverAt: now.Add(time.Minute), horizon: time.Minute, want: OutboxHotRegister, wantOK: true},
 		{name: "outside horizon has no outbox", deliverAt: now.Add(time.Minute + time.Nanosecond), horizon: time.Minute},
 	}
 	for _, tt := range tests {

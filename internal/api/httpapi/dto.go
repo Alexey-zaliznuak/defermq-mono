@@ -88,6 +88,7 @@ type messageResponse struct {
 	Attempts         int                    `json:"attempts"`
 	MaxAttempts      int                    `json:"max_attempts"`
 	LastError        *string                `json:"last_error,omitempty"`
+	LastAttemptAt    *time.Time             `json:"last_attempt_at,omitempty"`
 	CreatedAt        time.Time              `json:"created_at"`
 	UpdatedAt        time.Time              `json:"updated_at"`
 	DeliveredAt      *time.Time             `json:"delivered_at,omitempty"`
@@ -112,6 +113,7 @@ func responseFromDelivery(delivery domain.Delivery, detailed bool) (messageRespo
 		Attempts:         delivery.Attempts,
 		MaxAttempts:      delivery.MaxAttempts,
 		LastError:        delivery.LastError,
+		LastAttemptAt:    utcPointer(delivery.LastAttemptAt),
 		CreatedAt:        delivery.CreatedAt.UTC(),
 		UpdatedAt:        delivery.UpdatedAt.UTC(),
 		DeliveredAt:      utcPointer(delivery.DeliveredAt),

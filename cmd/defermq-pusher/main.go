@@ -53,6 +53,9 @@ func run(logger *zap.Logger) error {
 		MaxConns:        config.SourceMaxConns,
 		ConnectTimeout:  config.QueryTimeout,
 		QueryTimeout:    config.QueryTimeout,
+		RuntimeParams: map[string]string{
+			"synchronous_commit": config.SynchronousCommit,
+		},
 	})
 	if err != nil {
 		return err
@@ -132,9 +135,11 @@ func run(logger *zap.Logger) error {
 		workerCount := config.Workers[typ]
 		workerPool, poolErr := pusher.NewPool(pusher.PoolConfig{
 			Workers:            workerCount,
-			QueueSize:          workerCount * 2,
+			QueueSize:          max(workerCount*2, config.FetchBatch, config.ClaimBatch),
 			FetchBatchSize:     config.FetchBatch,
 			FetchMaxWait:       config.FetchMaxWait,
+			ClaimBatchSize:     config.ClaimBatch,
+			ClaimFlushInterval: config.ClaimFlushInterval,
 			ProcessingLease:    config.Lease,
 			HeartbeatInterval:  config.Heartbeat,
 			ClockSkewTolerance: config.ClockTolerance,

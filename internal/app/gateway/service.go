@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/defermq/defermq/internal/domain"
+	"github.com/defermq/defermq/internal/ingest"
 	"github.com/google/uuid"
 )
 
@@ -26,6 +27,7 @@ type Repository interface {
 }
 
 type CreateCommand struct {
+	DeliveryID      uuid.UUID
 	Payload         domain.Payload
 	Destination     json.RawMessage
 	DestinationType domain.DestinationType
@@ -126,7 +128,13 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (domain.Deliver
 		}
 		key = &trimmed
 	}
+	deliveryID, payloadID, err := ingest.IDs(key)
+	if err != nil {
+		return domain.Delivery{}, false, err
+	}
+	input.Payload.ID = payloadID
 	return s.repository.Create(ctx, CreateCommand{
+		DeliveryID:      deliveryID,
 		Payload:         input.Payload,
 		Destination:     destination,
 		DestinationType: input.Destination.Type,

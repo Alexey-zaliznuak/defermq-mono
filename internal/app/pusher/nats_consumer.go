@@ -25,6 +25,7 @@ type NATSConsumerConfig struct {
 
 type NATSConsumer struct {
 	consumer jetstream.Consumer
+	messages jetstream.MessagesContext
 	typ      domain.DestinationType
 }
 
@@ -52,24 +53,24 @@ func NewNATSConsumer(
 	if err != nil {
 		return nil, fmt.Errorf("ensure NATS consumer %q: %w", config.Durable, err)
 	}
-	return &NATSConsumer{consumer: consumer, typ: config.Type}, nil
+	messages, err := consumer.Messages(
+		jetstream.PullMaxMessages(config.MaxBatch),
+		jetstream.PullExpiry(config.MaxWait),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create NATS message iterator %q: %w", config.Durable, err)
+	}
+	return &NATSConsumer{consumer: consumer, messages: messages, typ: config.Type}, nil
 }
 
 func (c *NATSConsumer) Type() domain.DestinationType { return c.typ }
 
-func (c *NATSConsumer) Fetch(ctx context.Context, batch int, maxWait time.Duration) ([]Message, error) {
-	result, err := natsjs.FetchBatch(ctx, c.consumer, batch, maxWait)
+func (c *NATSConsumer) Next(ctx context.Context) (Message, error) {
+	message, err := c.messages.Next(jetstream.NextContext(ctx))
 	if err != nil {
 		return nil, err
 	}
-	messages := make([]Message, 0, batch)
-	for message := range result.Messages() {
-		messages = append(messages, natsMessage{message: message})
-	}
-	if err := result.Error(); err != nil {
-		return messages, err
-	}
-	return messages, nil
+	return natsMessage{message: message}, nil
 }
 
 func (c *NATSConsumer) Ready(ctx context.Context) error {
@@ -85,7 +86,10 @@ func (c *NATSConsumer) Pending(ctx context.Context) (uint64, int, error) {
 	return info.NumPending, info.NumAckPending, nil
 }
 
-func (c *NATSConsumer) Close(context.Context) error { return nil }
+func (c *NATSConsumer) Close(context.Context) error {
+	c.messages.Stop()
+	return nil
+}
 
 type natsMessage struct {
 	message jetstream.Msg

@@ -17,6 +17,7 @@ type RetentionCleaner struct {
 	Repository RetentionRepository
 	Config     RetentionConfig
 	OnError    ErrorHandler
+	Observe    LoopObserver
 }
 
 func (c *RetentionCleaner) Run(ctx context.Context) error {
@@ -25,12 +26,16 @@ func (c *RetentionCleaner) Run(ctx context.Context) error {
 		return errors.New("invalid retention cleaner configuration")
 	}
 	for {
+		started := time.Now()
 		full, err := c.clean(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
 			report(c.OnError, "retention_cleaner", err)
+			observeLoop(c.Observe, "retention_cleaner", started, false, false)
+		} else {
+			observeLoop(c.Observe, "retention_cleaner", started, true, full)
 		}
 		if err == nil && full {
 			continue

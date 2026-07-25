@@ -7,16 +7,17 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-func TestCompatibleStreamConfigIsAdditive(t *testing.T) {
+func TestCompatibleStreamConfigRemovesScheduledSubjects(t *testing.T) {
 	current := jetstream.StreamConfig{
-		Name:       "DEFERMQ",
-		Subjects:   []string{"legacy.subject"},
-		Storage:    jetstream.FileStorage,
-		Retention:  jetstream.LimitsPolicy,
-		MaxBytes:   2 << 30,
-		MaxAge:     48 * time.Hour,
-		MaxMsgSize: 128 << 10,
-		Replicas:   3,
+		Name:              "DEFERMQ",
+		Subjects:          []string{"legacy.subject"},
+		Storage:           jetstream.FileStorage,
+		Retention:         jetstream.LimitsPolicy,
+		MaxBytes:          2 << 30,
+		MaxAge:            48 * time.Hour,
+		MaxMsgSize:        128 << 10,
+		Replicas:          3,
+		AllowMsgSchedules: true,
 	}
 	desired := StreamConfig{
 		Name:            "DEFERMQ",
@@ -32,14 +33,14 @@ func TestCompatibleStreamConfigIsAdditive(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !changed || !merged.AllowMsgSchedules {
-		t.Fatal("scheduled messages were not enabled")
+		t.Fatal("existing schedule capability must be preserved for an upgrade-safe stream update")
 	}
 	if merged.MaxBytes != current.MaxBytes || merged.MaxAge != current.MaxAge ||
 		merged.MaxMsgSize != current.MaxMsgSize || merged.Replicas != current.Replicas {
 		t.Fatalf("existing limits were reduced: %+v", merged)
 	}
-	if len(merged.Subjects) != 3 {
-		t.Fatalf("subjects were not merged: %v", merged.Subjects)
+	if len(merged.Subjects) != 1 || merged.Subjects[0] != "defermq.ready.*" {
+		t.Fatalf("stream does not contain only ready subjects: %v", merged.Subjects)
 	}
 }
 

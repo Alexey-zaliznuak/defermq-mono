@@ -47,10 +47,10 @@ func TestScheduledDeliveryIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deliverAt := time.Now().UTC().Add(1500 * time.Millisecond)
+	deliverAt := time.Now().UTC()
 	publisher := NewPublisher(connection.JS, streamConfig.Subjects)
 	if err := publisher.Publish(ctx, PublishRequest{
-		Kind: OutboxSchedule, DeliveryID: uuid.New(), ScheduleRevision: 1,
+		Kind: OutboxReady, DeliveryID: uuid.New(), ScheduleRevision: 1,
 		DeliverAt: deliverAt, DestinationType: domain.DestinationHTTP,
 	}); err != nil {
 		t.Fatal(err)
@@ -62,9 +62,6 @@ func TestScheduledDeliveryIntegration(t *testing.T) {
 	message, ok := <-batch.Messages()
 	if !ok {
 		t.Fatalf("scheduled message not received: %v", batch.Error())
-	}
-	if time.Now().Before(deliverAt.Add(-100 * time.Millisecond)) {
-		t.Fatal("scheduled message arrived too early")
 	}
 	event, err := DecodeReadyEvent(message.Data(), domain.DestinationHTTP)
 	if err != nil {
